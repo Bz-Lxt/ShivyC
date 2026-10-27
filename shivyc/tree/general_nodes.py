@@ -6,11 +6,12 @@ import shivyc.il_cmds.value as value_cmds
 import shivyc.token_kinds as token_kinds
 import shivyc.tree.decl_nodes as decl_nodes
 from shivyc.ctypes import (PointerCType, ArrayCType, FunctionCType,
-                           StructCType, UnionCType)
+                           StructCType, UnionCType, VariableArrayCType)
 from shivyc.errors import CompilerError
 from shivyc.il_gen import ILValue
 from shivyc.tree.base_nodes import Node
-from shivyc.tree.utils import DirectLValue, report_err
+from shivyc.tree.utils import (DirectLValue, report_err, sizeof_ctype,
+                               pin_vla_sizes, is_variably_modified)
 
 
 class Root(Node):
@@ -47,12 +48,21 @@ class Compound(Node):
         if not no_scope:
             symbol_table.new_scope()
 
+            # Save the current stack position so storage backing variable
+            # length arrays declared in this block can be reclaimed when
+            # the block ends. This is safe even when no VLAs are declared
+            # because StackSave and StackRestore only copy the stack
+            # pointer without touching any actual data.
+            marker = ILValue(ctypes.unsig_longint)
+            il_code.add(control_cmds.StackSave(marker))
+
         c = c.set_global(False)
         for item in self.items:
             with report_err():
                 item.make_il(il_code, symbol_table, c)
 
         if not no_scope:
+            il_code.add(control_cmds.StackRestore(marker))
             symbol_table.end_scope()
 
 
@@ -133,17 +143,56 @@ class DeclInfo:
             err = "local variable with linkage has initializer"
             raise CompilerError(err, self.range)
 
-        var = symbol_table.add_variable(
-            self.identifier,
-            self.ctype,
-            defined,
-            linkage,
-            storage)
+        # A variable length array (or any variably modified array type)
+        # with automatic storage duration is allocated on the stack at
+        # runtime. The declared variable itself is backed by an automatic
+        # pointer which holds the address of the allocated region.
+        is_vla_object = (not self.body
+                         and self.ctype.is_array()
+                         and is_variably_modified(self.ctype))
 
-        if self.init:
-            self.do_init(var, storage, il_code, symbol_table, c)
-        if self.body:
-            self.do_body(il_code, symbol_table, c)
+        if is_vla_object:
+            if c.is_global or linkage:
+                err = "array size must be compile-time constant"
+                raise CompilerError(err, self.range)
+            if storage == symbol_table.STATIC:
+                err = "array size must be compile-time constant"
+                raise CompilerError(err, self.range)
+            if self.init:
+                err = "variable length array cannot be initialized"
+                raise CompilerError(err, self.range)
+
+            var = symbol_table.add_variable(
+                self.identifier,
+                PointerCType(self.ctype.el),
+                defined,
+                linkage,
+                storage)
+            var.vla_ctype = self.ctype
+
+            # Evaluate the array size expressions and allocate storage.
+            # The size expressions are evaluated in declaration order,
+            # with the outermost bound evaluated first.
+            size = sizeof_ctype(self.ctype, il_code, symbol_table, c)
+            il_code.add(control_cmds.StackAlloc(var, size))
+        else:
+            var = symbol_table.add_variable(
+                self.identifier,
+                self.ctype,
+                defined,
+                linkage,
+                storage)
+
+            # Evaluate any VLA bounds appearing in a variably modified
+            # pointer type, such as `int (*p)[n]`, at this point.
+            if (not c.is_global and not linkage
+                  and storage == symbol_table.AUTOMATIC):
+                pin_vla_sizes(self.ctype, il_code, symbol_table, c)
+
+            if self.init:
+                self.do_init(var, storage, il_code, symbol_table, c)
+            if self.body:
+                self.do_body(il_code, symbol_table, c)
 
         if not linkage and self.ctype.is_incomplete():
             err = "variable of incomplete type declared"
@@ -211,6 +260,10 @@ class DeclInfo:
                 param, ctype, symbol_table.DEFINED, None,
                 symbol_table.AUTOMATIC)
             il_code.add(value_cmds.LoadArg(arg, i))
+            # Evaluate any VLA bounds in a variably modified parameter
+            # type (for example, `int a[n][m]` which is adjusted to a
+            # pointer to a variable length array).
+            pin_vla_sizes(ctype, il_code, symbol_table, c)
 
         self.body.make_il(il_code, symbol_table, c, no_scope=True)
         if not il_code.always_returns() and is_main:
@@ -371,44 +424,89 @@ class Declaration(Node):
         return self.make_ctype(decl.child, new_ctype)
 
     def _generate_array_ctype(self, decl, prev_ctype):
-        """Generate a function ctype from a given a decl_node."""
+        """Generate an array ctype from a given decl_node.
+
+        If the size expression is an integer constant expression a normal
+        fixed size array type is produced. Otherwise a variable length
+        array type is produced, and the size expression is left unevaluated
+        until the declaration is processed (or the type is used as the
+        operand of sizeof).
+        """
+
+        if not prev_ctype.is_complete():
+            err = "array elements must have complete type"
+            raise CompilerError(err, decl.r)
 
         if decl.n:
-            il_value = decl.n.make_il(self.il_code, self.symbol_table, self.c)
+            # Evaluate the size expression against a throwaway IL code
+            # object here, just to type-check it and to tell whether it is
+            # a compile-time constant.
+            dummy_il_code = self.il_code.copy()
+            dummy_il_code.vla_dry_run = True
+            if dummy_il_code.cur_func is None:
+                # Type generation can happen outside of any function (for
+                # file-scope declarations and struct members), where there
+                # is no command list to append to. Give the throwaway IL
+                # code a dummy function slot - everything emitted is
+                # discarded with the dummy object anyway.
+                dummy_func = object()
+                dummy_il_code.cur_func = dummy_func
+                dummy_il_code.commands[dummy_func] = []
+            il_value = decl.n.make_il(
+                dummy_il_code, self.symbol_table, self.c)
             if not il_value.ctype.is_integral():
                 err = "array size must have integral type"
                 raise CompilerError(err, decl.r)
-            if not il_value.literal:
-                err = "array size must be compile-time constant"
-                raise CompilerError(err, decl.r)
-            if il_value.literal.val <= 0:
-                err = "array size must be positive"
-                raise CompilerError(err, decl.r)
-            if not prev_ctype.is_complete():
-                err = "array elements must have complete type"
-                raise CompilerError(err, decl.r)
-            return ArrayCType(prev_ctype, il_value.literal.val)
+            if il_value.literal:
+                if il_value.literal.val <= 0:
+                    err = "array size must be positive"
+                    raise CompilerError(err, decl.r)
+                return ArrayCType(prev_ctype, il_value.literal.val)
+            else:
+                return VariableArrayCType(prev_ctype, decl.n)
         else:
             return ArrayCType(prev_ctype, None)
+
+    def _get_param_infos(self, func_decl):
+        """Return DeclInfo objects for the parameters of func_decl.
+
+        Parameters are processed in order inside a temporary scope, and
+        each named parameter is made visible as a placeholder variable to
+        following parameters. This is required so that bounds of variable
+        length array parameters can refer to earlier parameters, as in
+        `int f(int n, int m, int a[n][m])`.
+        """
+
+        # Create a new scope because if we create a new struct type inside
+        # the function parameters, it should be local to those parameters.
+        self.symbol_table.new_scope()
+        infos = []
+        try:
+            for param in func_decl.args:
+                decl_info = self.get_decl_infos(param)[0]
+                infos.append(decl_info)
+
+                if decl_info.identifier:
+                    self.symbol_table.add_variable(
+                        decl_info.identifier,
+                        decl_info.ctype,
+                        self.symbol_table.DEFINED, None,
+                        self.symbol_table.AUTOMATIC)
+        finally:
+            self.symbol_table.end_scope()
+        return infos
 
     def _generate_func_ctype(self, decl, prev_ctype):
         """Generate a function ctype from a given a decl_node."""
 
         # Prohibit storage class specifiers in parameters.
-        for param in decl.args:
-            decl_info = self.get_decl_infos(param)[0]
+        for decl_info in self._get_param_infos(decl):
             if decl_info.storage:
                 err = "storage class specified for function parameter"
                 raise CompilerError(err, decl_info.range)
 
-        # Create a new scope because if we create a new struct type inside
-        # the function parameters, it should be local to those parameters.
-        self.symbol_table.new_scope()
-        args = [
-            self.get_decl_infos(decl)[0].ctype
-            for decl in decl.args
-        ]
-        self.symbol_table.end_scope()
+        infos = self._get_param_infos(decl)
+        args = [decl_info.ctype for decl_info in infos]
 
         # adjust array and function parameters
         has_void = False
@@ -459,8 +557,7 @@ class Declaration(Node):
             err = "function definition missing parameter list"
             raise CompilerError(err, self.r)
 
-        for param in func_decl.args:
-            decl_info = self.get_decl_infos(param)[0]
+        for decl_info in self._get_param_infos(func_decl):
             identifiers.append(decl_info.identifier)
 
         return identifiers
@@ -657,6 +754,10 @@ class Declaration(Node):
         # TODO: 6.7.2.1.18 (allow flexible array members)
         if not decl_info.ctype.is_complete():
             err = f"cannot have incomplete type as {kind} member"
+            raise CompilerError(err, decl_info.range)
+
+        if is_variably_modified(decl_info.ctype):
+            err = f"cannot have variable length array type as {kind} member"
             raise CompilerError(err, decl_info.range)
 
         # TODO: 6.7.2.1.13 (anonymous structs)

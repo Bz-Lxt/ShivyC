@@ -118,6 +118,11 @@ class ILValue:
         self.ctype = ctype
         self.literal = None
 
+        # If this IL value is the pointer variable that backs a variable
+        # length array object, this stores the original (variably modified)
+        # array type. Otherwise, this is None.
+        self.vla_ctype = None
+
     def __str__(self):  # pragma: no cover
         return f'{id(self) % 1000:03}'
 
@@ -367,6 +372,18 @@ class Context:
     position would jump.
     is_global - Whether the current scope is global or within a function.
     Used by declarations to modify emitted code.
+
+    The current stack position is saved into a marker IL value when a block
+    or loop is entered. Restoring the marker deallocates every variable
+    length array allocated since the marker was saved:
+
+    break_marker - Marker to restore on a `break` statement, which frees
+    storage allocated inside the innermost loop (while preserving storage
+    for objects which remain in scope after the loop).
+    continue_marker - Marker to restore on a `continue` statement.
+
+    Function returns do not use a marker because the function epilogue
+    resets the stack pointer directly.
     """
 
     def __init__(self):
@@ -375,6 +392,8 @@ class Context:
         self.continue_label = None
         self.return_type = None
         self.is_global = False
+        self.break_marker = None
+        self.continue_marker = None
 
     def set_global(self, val):
         """Return copy of self with is_global set to given value."""
@@ -382,16 +401,18 @@ class Context:
         c.is_global = val
         return c
 
-    def set_break(self, lab):
+    def set_break(self, lab, marker=None):
         """Return copy of self with break_label set to given value."""
         c = copy(self)
         c.break_label = lab
+        c.break_marker = marker
         return c
 
-    def set_continue(self, lab):
-        """Return copy of self with break_label set to given value."""
+    def set_continue(self, lab, marker=None):
+        """Return copy of self with continue_label set to given value."""
         c = copy(self)
         c.continue_label = lab
+        c.continue_marker = marker
         return c
 
     def set_return(self, ctype):

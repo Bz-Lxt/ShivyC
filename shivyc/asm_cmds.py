@@ -147,6 +147,9 @@ class Add(_ASMCommand): name = "add"  # noqa: D101
 class Sub(_ASMCommand): name = "sub"  # noqa: D101
 
 
+class And(_ASMCommand): name = "and"  # noqa: D101
+
+
 class Neg(_ASMCommand): name = "neg"  # noqa: D101
 
 

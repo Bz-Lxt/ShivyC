@@ -1,7 +1,9 @@
 """Control flow statement nodes in the AST."""
 
+import shivyc.ctypes as ctypes
 import shivyc.il_cmds.control as control_cmds
 from shivyc.errors import CompilerError
+from shivyc.il_gen import ILValue
 from shivyc.tree.base_nodes import Node
 from shivyc.tree.utils import report_err, set_type, check_cast
 
@@ -38,6 +40,10 @@ class _BreakContinue(Node):
     # Function which accepts a dummy variable and Context and returns the label
     # to which to jump when this statement is encountered.
     get_label = lambda _, c: None
+    # Function which returns the stack marker to restore before jumping,
+    # so storage of variable length arrays allocated inside the loop body
+    # is reclaimed.
+    get_marker = lambda _, c: None
     # "break" if this is a break statement, or "continue" if this is a continue
     # statement
     descrip = None
@@ -50,6 +56,9 @@ class _BreakContinue(Node):
         """Make IL code for returning this value."""
         label = self.get_label(c)
         if label:
+            marker = self.get_marker(c)
+            if marker:
+                il_code.add(control_cmds.StackRestore(marker))
             il_code.add(control_cmds.Jump(label))
         else:
             with report_err():
@@ -61,6 +70,7 @@ class Break(_BreakContinue):
     """Node for a break statement."""
 
     get_label = lambda _, c: c.break_label
+    get_marker = lambda _, c: c.break_marker
     descrip = "break"
 
 
@@ -68,6 +78,7 @@ class Continue(_BreakContinue):
     """Node for a continue statement."""
 
     get_label = lambda _, c: c.continue_label
+    get_marker = lambda _, c: c.continue_marker
     descrip = "continue"
 
 
@@ -127,20 +138,38 @@ class WhileStatement(Node):
     def make_il(self, il_code, symbol_table, c):
         """Make code for this node."""
         start = il_code.get_label()
+        cont = il_code.get_label()
+        test = il_code.get_label()
         end = il_code.get_label()
 
-        il_code.add(control_cmds.Label(start))
-        c = c.set_continue(start).set_break(end)
+        # Marker of the stack position before the loop body runs. Any
+        # variable length arrays allocated in the body must be freed at the
+        # end of each iteration, and also when leaving through a break or
+        # continue.
+        marker = ILValue(ctypes.unsig_longint)
+        il_code.add(control_cmds.StackSave(marker))
+        c = c.set_continue(cont, marker).set_break(end, marker)
 
-        with report_err():
-            cond = self.cond.make_il(il_code, symbol_table, c)
-            il_code.add(control_cmds.JumpZero(cond, end))
+        il_code.add(control_cmds.Jump(test))
+        il_code.add(control_cmds.Label(start))
+        il_code.add(control_cmds.StackSave(marker))
 
         with report_err():
             self.stat.make_il(il_code, symbol_table, c)
 
+        # Both normal fall-through and a continue land here, so the stack
+        # is always rewound before the condition is evaluated again.
+        il_code.add(control_cmds.Label(cont))
+        il_code.add(control_cmds.StackRestore(marker))
+
+        il_code.add(control_cmds.Label(test))
+        with report_err():
+            cond = self.cond.make_il(il_code, symbol_table, c)
+            il_code.add(control_cmds.JumpZero(cond, end))
         il_code.add(control_cmds.Jump(start))
+
         il_code.add(control_cmds.Label(end))
+        il_code.add(control_cmds.StackRestore(marker))
 
 
 class ForStatement(Node):
@@ -161,7 +190,13 @@ class ForStatement(Node):
         self.stat = stat
 
     def make_il(self, il_code, symbol_table, c):
-        """Make code for this node."""
+        """Make code for this loop."""
+        # Save the stack position before the first clause, because a
+        # variable length array declared there must live for the whole
+        # loop and be reclaimed when the loop finishes.
+        loop_marker = ILValue(ctypes.unsig_longint)
+        il_code.add(control_cmds.StackSave(loop_marker))
+
         symbol_table.new_scope()
         if self.first:
             self.first.make_il(il_code, symbol_table, c)
@@ -169,9 +204,15 @@ class ForStatement(Node):
         start = il_code.get_label()
         cont = il_code.get_label()
         end = il_code.get_label()
-        c = c.set_continue(cont).set_break(end)
+
+        # Marker of the stack position at the start of each iteration,
+        # used to free variable length arrays declared in the loop body
+        # when the iteration ends, including through break or continue.
+        marker = ILValue(ctypes.unsig_longint)
+        c = c.set_continue(cont, marker).set_break(end, marker)
 
         il_code.add(control_cmds.Label(start))
+        il_code.add(control_cmds.StackSave(marker))
         with report_err():
             if self.second:
                 cond = self.second.make_il(il_code, symbol_table, c)
@@ -180,7 +221,10 @@ class ForStatement(Node):
         with report_err():
             self.stat.make_il(il_code, symbol_table, c)
 
+        # Both normal fall-through and a continue land here, so the stack
+        # is always rewound before the third clause runs.
         il_code.add(control_cmds.Label(cont))
+        il_code.add(control_cmds.StackRestore(marker))
 
         with report_err():
             if self.third:
@@ -188,5 +232,7 @@ class ForStatement(Node):
 
         il_code.add(control_cmds.Jump(start))
         il_code.add(control_cmds.Label(end))
+        il_code.add(control_cmds.StackRestore(marker))
 
         symbol_table.end_scope()
+        il_code.add(control_cmds.StackRestore(loop_marker))

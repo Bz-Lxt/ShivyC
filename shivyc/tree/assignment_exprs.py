@@ -70,7 +70,8 @@ class _CompoundPlusMinus(_RExprNode):
             left = self.left.make_il(il_code, symbol_table, c)
 
             out = ILValue(left.ctype)
-            shift = get_size(left.ctype.arg, right, il_code)
+            shift = get_size(left.ctype.arg, right, il_code,
+                             symbol_table, c)
 
             il_code.add(self.command(out, left, shift))
             lvalue.set_to(out, il_code, self.op.r)

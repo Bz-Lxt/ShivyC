@@ -86,6 +86,46 @@ class DirectLValue(LValue):
         return self.il_value
 
 
+class VariableArrayLValue(LValue):
+    """Represents a variable length array object.
+
+    A variable length array is backed by an automatic pointer variable
+    which holds the address of the dynamically allocated storage. This
+    LValue behaves like an array type (so it decays to a pointer to its
+    element type in most contexts) but its address expressions work on the
+    backing pointer variable instead of a fixed stack slot.
+
+    var - ILValue of pointer-to-element type holding the array storage
+    vla_ctype - the original variably modified array type
+    """
+
+    def __init__(self, var, vla_ctype):
+        self.var = var
+        self._ctype = vla_ctype
+
+    def ctype(self):  # noqa D102
+        return self._ctype
+
+    def set_to(self, rvalue, il_code, r):  # noqa D102
+        # Arrays are not modifiable, so this should never be called.
+        raise NotImplementedError
+
+    def addr(self, il_code):  # noqa D102
+        # The backing variable is a pointer to the element type, but the
+        # address of a VLA is a pointer to the whole array type. The two
+        # hold the same numeric address, so emit a retyped copy.
+        out = ILValue(PointerCType(self._ctype))
+        il_code.add(value_cmds.Set(out, self.var))
+        return out
+
+    def val(self, il_code):  # noqa D102
+        # An array can never be read as a value, but this is called when
+        # deriving the raw (undecayed) type of an expression, as in
+        # `sizeof a`. Return a fresh ILValue carrying the array type only,
+        # without emitting any code.
+        return ILValue(self._ctype)
+
+
 class IndirectLValue(LValue):
     """Represents an indirect LValue.
 
@@ -394,7 +434,89 @@ def arith_convert(left, right, il_code):
     return set_type(left, ctype, il_code), set_type(right, ctype, il_code)
 
 
-def get_size(ctype, num, il_code):
+def vla_count(vla_ctype, il_code, symbol_table, c):
+    """Evaluate and cache the element count of a variable length array.
+
+    Returns an unsigned long ILValue holding the number of elements. The
+    size expression is evaluated at most once for each VLA type so that
+    sizeof, multidimensional indexing and pointer arithmetic all use the
+    same bound, exactly as the expression had been evaluated once when the
+    declaration was encountered.
+    """
+    if vla_ctype.size_val is None:
+        raw = vla_ctype.size_node.make_il(il_code, symbol_table, c)
+        if not raw.ctype.is_integral():
+            raise CompilerError(
+                "size of variable length array must have integer type",
+                vla_ctype.size_node.r)
+        converted = set_type(
+            raw, ctypes.unsig_longint, il_code)
+
+        # When evaluating against a throwaway IL code (used only to infer
+        # a type, as in sizeof of an expression), do not cache the result
+        # because the IL commands defining it are going to be discarded.
+        if getattr(il_code, "vla_dry_run", False):
+            return converted
+        vla_ctype.size_val = converted
+    return vla_ctype.size_val
+
+
+def is_variably_modified(ctype):
+    """Return whether `ctype` is a variably modified type.
+
+    A variably modified type is a variable length array type, or an array
+    or pointer type whose referenced type is variably modified.
+    """
+    if ctype.is_vla():
+        return True
+    elif ctype.is_array():
+        return is_variably_modified(ctype.el)
+    elif ctype.is_pointer():
+        return is_variably_modified(ctype.arg)
+    return False
+
+
+def sizeof_ctype(ctype, il_code, symbol_table, c):
+    """Return an unsigned long ILValue representing sizeof(ctype).
+
+    For a fixed size type this is a literal, while for a variable length
+    array type the bound expression is evaluated at runtime and multiplied
+    by the runtime size of the element type.
+    """
+    if ctype.is_vla():
+        # The outermost bound expression is evaluated before any bound
+        # expression in the element type, matching declaration order.
+        count = vla_count(ctype, il_code, symbol_table, c)
+        elem_size = sizeof_ctype(ctype.el, il_code, symbol_table, c)
+        out = ILValue(ctypes.unsig_longint)
+        il_code.add(math_cmds.Mult(out, count, elem_size))
+        return out
+    else:
+        out = ILValue(ctypes.unsig_longint)
+        il_code.register_literal_var(out, str(ctype.size))
+        return out
+
+
+def pin_vla_sizes(ctype, il_code, symbol_table, c):
+    """Evaluate all VLA bounds reachable through `ctype` now.
+
+    Used when a variably modified object is declared (for example, a
+    pointer to a VLA like `int (*p)[n]`) so the size expressions are
+    evaluated at declaration order even though no VLA storage itself is
+    allocated.
+    """
+    if ctype.is_vla():
+        # The outermost bound expression is evaluated before any bound
+        # expression in the element type, matching declaration order.
+        vla_count(ctype, il_code, symbol_table, c)
+        pin_vla_sizes(ctype.el, il_code, symbol_table, c)
+    elif ctype.is_array():
+        pin_vla_sizes(ctype.el, il_code, symbol_table, c)
+    elif ctype.is_pointer():
+        pin_vla_sizes(ctype.arg, il_code, symbol_table, c)
+
+
+def get_size(ctype, num, il_code, symbol_table=None, c=None):
     """Return ILValue representing total size of `num` objects of given ctype.
 
     ctype - CType of object to count
@@ -403,8 +525,15 @@ def get_size(ctype, num, il_code):
 
     long_num = set_type(num, ctypes.longint, il_code)
     total = ILValue(ctypes.longint)
-    size = ILValue(ctypes.longint)
-    il_code.register_literal_var(size, str(ctype.size))
+
+    if ctype.is_vla():
+        size = set_type(
+            sizeof_ctype(ctype, il_code, symbol_table, c),
+            ctypes.longint, il_code)
+    else:
+        size = ILValue(ctypes.longint)
+        il_code.register_literal_var(size, str(ctype.size))
+
     il_code.add(math_cmds.Mult(total, long_num, size))
 
     return total

@@ -5,7 +5,7 @@ from shivyc.errors import CompilerError
 from shivyc.il_gen import ILValue
 from shivyc.tree.expr_base import _RExprNode
 from shivyc.tree.general_nodes import Declaration
-from shivyc.tree.utils import set_type
+from shivyc.tree.utils import set_type, sizeof_ctype as runtime_sizeof
 
 
 class _SizeofNode(_RExprNode):
@@ -14,8 +14,13 @@ class _SizeofNode(_RExprNode):
     def __init__(self):
         super().__init__()
 
-    def sizeof_ctype(self, ctype, range, il_code):
-        """Raise CompilerError if ctype is not valid as sizeof argument."""
+    def sizeof_ctype(self, ctype, range, il_code, symbol_table, c):
+        """Return IL code for the size of the given type.
+
+        Raises CompilerError if ctype is not valid as a sizeof argument.
+        For a variable length array type the resulting size is a runtime
+        value, and the bound expressions are evaluated.
+        """
 
         if ctype.is_function():
             err = "sizeof argument cannot have function type"
@@ -25,9 +30,7 @@ class _SizeofNode(_RExprNode):
             err = "sizeof argument cannot have incomplete type"
             raise CompilerError(err, range)
 
-        out = ILValue(ctypes.unsig_longint)
-        il_code.register_literal_var(out, ctype.size)
-        return out
+        return runtime_sizeof(ctype, il_code, symbol_table, c)
 
 
 class SizeofExpr(_SizeofNode):
@@ -40,11 +43,18 @@ class SizeofExpr(_SizeofNode):
         self.expr = expr
 
     def make_il(self, il_code, symbol_table, c):
-        """Return a compile-time integer literal as the expression size."""
+        """Make IL for this sizeof expression.
+
+        Normally the operand expression is not evaluated, but if its type
+        is a variable length array type the size is a runtime value (the
+        bound itself was evaluated when the array was declared).
+        """
 
         dummy_il_code = il_code.copy()
+        dummy_il_code.vla_dry_run = True
         expr = self.expr.make_il_raw(dummy_il_code, symbol_table, c)
-        return self.sizeof_ctype(expr.ctype, self.expr.r, il_code)
+        return self.sizeof_ctype(
+            expr.ctype, self.expr.r, il_code, symbol_table, c)
 
 
 class SizeofType(_SizeofNode, Declaration):
@@ -57,12 +67,17 @@ class SizeofType(_SizeofNode, Declaration):
         Declaration.__init__(self, node)   # sets self.node = node
 
     def make_il(self, il_code, symbol_table, c):
-        """Return a compile-time integer literal as the expression size."""
+        """Make IL for this sizeof expression.
+
+        If the type is a variable length array type, the size expression is
+        evaluated at runtime.
+        """
 
         self.set_self_vars(il_code, symbol_table, c)
         base_type, _ = self.make_specs_ctype(self.node.specs, False)
         ctype, _ = self.make_ctype(self.node.decls[0], base_type)
-        return self.sizeof_ctype(ctype, self.node.decls[0].r, il_code)
+        return self.sizeof_ctype(
+            ctype, self.node.decls[0].r, il_code, symbol_table, c)
 
 
 class Cast(Declaration, _RExprNode):

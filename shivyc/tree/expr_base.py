@@ -102,6 +102,14 @@ class _LExprNode(_ExprNode):
 
     def lvalue(self, il_code, symbol_table, c):
         """Return an LValue object representing this node."""
+        # When evaluating against a throwaway IL code (a dry run used only
+        # to infer types or whether an array bound is constant), do not
+        # cache the result. Dry runs may resolve identifiers against a
+        # temporary symbol table (for example, placeholder parameters),
+        # and caching here would bind this node to the wrong variable when
+        # it is evaluated again for real.
+        if getattr(il_code, "vla_dry_run", False):
+            return self._lvalue(il_code, symbol_table, c)
         if not self._cache_lvalue:
             self._cache_lvalue = self._lvalue(il_code, symbol_table, c)
         return self._cache_lvalue

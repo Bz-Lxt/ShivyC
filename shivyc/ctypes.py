@@ -74,6 +74,16 @@ class CType:
         """Check whether this is an array type."""
         return False
 
+    def is_vla(self):
+        """Check whether this is a variable length array type.
+
+        A variable length array (C11 6.7.6.2) is an array whose size is not
+        an integer constant expression. Its size and alignment are only
+        known at runtime, so the static `size` attribute is meaningless for
+        such a type.
+        """
+        return False
+
     def is_struct_union(self):
         """Check whether this has struct or union type."""
         return False
@@ -223,10 +233,18 @@ class ArrayCType(CType):
         self.n = n
         super().__init__((n or 1) * self.el.size)
 
+    def weak_compat(self, other):
+        """Return True iff other is a weakly compatible type to self.
+
+        Array bounds are ignored here - only the element type matters.
+        """
+        return other.is_array() and self.el.weak_compat(other.el)
+
     def compatible(self, other):
         """Return True iff other is a compatible type to self."""
         return (other.is_array() and self.el.compatible(other.el)
-                and (self.n is None or other.n is None or self.n == other.n))
+                and (self.n is None or other.is_vla() or other.n is None
+                     or self.n == other.n))
 
     def is_complete(self):
         """Check if this is a complete type."""
@@ -241,6 +259,62 @@ class ArrayCType(CType):
 
     def is_array(self):
         """Check whether this is an array type."""
+        return True
+
+
+class VariableArrayCType(CType):
+    """Represents a C11 variable length array type.
+
+    el (CType) - Type of each element in array.
+    size_node (Node) - AST node for the array size expression. This is
+    evaluated at runtime, in declaration order.
+    size_val - ILValue holding the evaluated, converted (unsigned long)
+    array size in elements. This is cached on first evaluation so that
+    sizeof, pointer arithmetic and multidimensional indexing all observe
+    the same bound. It is None until pinned by IL generation.
+
+    Note that the static `size` attribute inherited from CType is set to 0
+    and must never be consulted for this type - the element count and total
+    size are runtime values.
+    """
+
+    def __init__(self, el, size_node):
+        """Initialize type."""
+        self.el = el
+        self.size_node = size_node
+        self.size_val = None
+        super().__init__(0)
+
+    def weak_compat(self, other):
+        """Return True iff other is a weakly compatible type to self.
+
+        Bounds are not compared - only the element type matters.
+        """
+        return other.is_array() and self.el.weak_compat(other.el)
+
+    def compatible(self, other):
+        """Return True iff other is a compatible type to self.
+
+        For two array types to be compatible, their element types must be
+        compatible. Bounds are not compared (a variable length array is
+        compatible with any array of the same element type).
+        """
+        return other.is_array() and self.el.compatible(other.el)
+
+    def is_complete(self):
+        """A variable length array is always a complete type."""
+        return True
+
+    def is_object(self):
+        """Check if this is an object type."""
+        return True
+
+    def is_array(self):
+        """Check whether this is an array type."""
+        return True
+
+    def is_vla(self):
+        """Check whether this is a variable length array type."""
         return True
 
 

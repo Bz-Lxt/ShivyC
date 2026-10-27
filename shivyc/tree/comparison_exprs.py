@@ -23,7 +23,7 @@ class _Equality(_ArithBinOp):
         il_code.add(self.eq_il_cmd(out, left, right))
         return out
 
-    def _nonarith(self, left, right, il_code):
+    def _nonarith(self, left, right, il_code, symbol_table, c):
         """Check equality of non-arithmetic expressions."""
 
         # If either operand is a null pointer constant, cast it to the
@@ -88,7 +88,7 @@ class _Relational(_ArithBinOp):
         il_code.add(self.comp_cmd(out, left, right))
         return out
 
-    def _nonarith(self, left, right, il_code):
+    def _nonarith(self, left, right, il_code, symbol_table, c):
         """Compare non-arithmetic expressions."""
 
         if not left.ctype.is_pointer() or not right.ctype.is_pointer():

@@ -6,7 +6,7 @@ from shivyc.ctypes import ArrayCType
 from shivyc.errors import CompilerError
 from shivyc.il_gen import ILValue
 from shivyc.tree.expr_base import _RExprNode, _LExprNode
-from shivyc.tree.utils import DirectLValue
+from shivyc.tree.utils import DirectLValue, VariableArrayLValue
 
 
 class MultiExpr(_RExprNode):
@@ -83,6 +83,8 @@ class Identifier(_LExprNode):
 
     def _lvalue(self, il_code, symbol_table, c):
         var = symbol_table.lookup_variable(self.identifier)
+        if var.vla_ctype:
+            return VariableArrayLValue(var, var.vla_ctype)
         return DirectLValue(var)
 
 

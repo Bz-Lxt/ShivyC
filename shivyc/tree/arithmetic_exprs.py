@@ -5,7 +5,8 @@ import shivyc.il_cmds.math as math_cmds
 from shivyc.errors import CompilerError
 from shivyc.il_gen import ILValue
 from shivyc.tree.expr_base import _RExprNode
-from shivyc.tree.utils import arith_convert, get_size, shift_into_range
+from shivyc.tree.utils import (arith_convert, get_size, set_type,
+                               shift_into_range, sizeof_ctype)
 
 
 class _ArithBinOp(_RExprNode):
@@ -49,7 +50,8 @@ class _ArithBinOp(_RExprNode):
             return self._arith(left, right, il_code)
 
         else:
-            return self._nonarith(left, right, il_code)
+            return self._nonarith(
+                left, right, il_code, symbol_table, c)
 
     default_il_cmd = None
 
@@ -98,7 +100,7 @@ class _ArithBinOp(_RExprNode):
         """
         raise NotImplementedError
 
-    def _nonarith(self, left, right, il_code):
+    def _nonarith(self, left, right, il_code, symbol_table, c):
         """Return the result of this operation on given nonarithmetic operands.
 
         left - ILValue for left operand
@@ -124,7 +126,7 @@ class Plus(_ArithBinOp):
     def _arith_const(self, left, right, ctype):
         return shift_into_range(left + right, ctype)
 
-    def _nonarith(self, left, right, il_code):
+    def _nonarith(self, left, right, il_code, symbol_table, c):
         """Make addition code if either operand is non-arithmetic type."""
 
         # One operand should be pointer to complete object type, and the
@@ -143,7 +145,8 @@ class Plus(_ArithBinOp):
 
         # Multiply by size of objects
         out = ILValue(pointer.ctype)
-        shift = get_size(pointer.ctype.arg, arith, il_code)
+        shift = get_size(pointer.ctype.arg, arith, il_code,
+                         symbol_table, c)
         il_code.add(math_cmds.Add(out, pointer, shift))
         return out
 
@@ -165,7 +168,7 @@ class Minus(_ArithBinOp):
     def _arith_const(self, left, right, ctype):
         return shift_into_range(left - right, ctype)
 
-    def _nonarith(self, left, right, il_code):
+    def _nonarith(self, left, right, il_code, symbol_table, c):
         """Make subtraction code if both operands are non-arithmetic type."""
 
         # TODO: this isn't quite right when we allow qualifiers
@@ -181,10 +184,13 @@ class Minus(_ArithBinOp):
             raw = ILValue(ctypes.longint)
             il_code.add(math_cmds.Subtr(raw, left, right))
 
-            # Divide by size of object
+            # Divide by size of object. The pointed-to type may itself be a
+            # variable length array, in which case its size is a runtime
+            # value.
             out = ILValue(ctypes.longint)
-            size = ILValue(ctypes.longint)
-            il_code.register_literal_var(size, str(left.ctype.arg.size))
+            size = set_type(
+                sizeof_ctype(left.ctype.arg, il_code, symbol_table, c),
+                ctypes.longint, il_code)
             il_code.add(math_cmds.Div(out, raw, size))
 
             return out
@@ -197,7 +203,8 @@ class Minus(_ArithBinOp):
                 raise CompilerError(err, self.op.r)
 
             out = ILValue(left.ctype)
-            shift = get_size(left.ctype.arg, right, il_code)
+            shift = get_size(left.ctype.arg, right, il_code,
+                             symbol_table, c)
             il_code.add(math_cmds.Subtr(out, left, shift))
             return out
 
@@ -218,7 +225,7 @@ class Mult(_ArithBinOp):
     def _arith_const(self, left, right, ctype):
         return shift_into_range(left * right, ctype)
 
-    def _nonarith(self, left, right, il_code):
+    def _nonarith(self, left, right, il_code, symbol_table, c):
         err = "invalid operand types for multiplication"
         raise CompilerError(err, self.op.r)
 
@@ -247,7 +254,7 @@ class Div(_ArithBinOp):
     def _arith_const(self, left, right, ctype):
         return shift_into_range(int(left / right), ctype)
 
-    def _nonarith(self, left, right, il_code):
+    def _nonarith(self, left, right, il_code, symbol_table, c):
         err = "invalid operand types for division"
         raise CompilerError(err, self.op.r)
 
@@ -261,7 +268,7 @@ class Mod(_IntBinOp):
 
     default_il_cmd = math_cmds.Mod
 
-    def _nonarith(self, left, right, il_code):
+    def _nonarith(self, left, right, il_code, symbol_table, c):
         err = "invalid operand types for modulus"
         raise CompilerError(err, self.op.r)
 
@@ -275,7 +282,7 @@ class _BitShift(_IntBinOp):
         """Initialize node."""
         super().__init__(left, right, op)
 
-    def _nonarith(self, left, right, il_code):
+    def _nonarith(self, left, right, il_code, symbol_table, c):
         err = "invalid operand types for bitwise shift"
         raise CompilerError(err, self.op.r)
 

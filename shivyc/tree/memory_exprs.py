@@ -109,24 +109,27 @@ class ArraySubsc(_LExprNode):
             arg_val = self.arg.make_il(il_code, symbol_table, c)
 
             if head_val.ctype.is_pointer() and arg_val.ctype.is_integral():
-                return self.pointer_subsc(head_val, arg_val, il_code)
+                return self.pointer_subsc(
+                    head_val, arg_val, il_code, symbol_table, c)
             elif arg_val.ctype.is_pointer() and head_val.ctype.is_integral():
-                return self.pointer_subsc(head_val, arg_val, il_code)
+                return self.pointer_subsc(
+                    head_val, arg_val, il_code, symbol_table, c)
 
         descrip = "invalid operand types for array subscriping"
         raise CompilerError(descrip, self.r)
 
-    def pointer_subsc(self, point, arith, il_code):
+    def pointer_subsc(self, point, arith, il_code, symbol_table, c):
         """Return the LValue for this node.
 
         This function is called in the case where one operand is a pointer
-        and the other operand is an integer.
+        and the other is an integer.
         """
         if not point.ctype.arg.is_complete():
             err = "cannot subscript pointer to incomplete type"
             raise CompilerError(err, self.r)
 
-        shift = get_size(point.ctype.arg, arith, il_code)
+        shift = get_size(point.ctype.arg, arith, il_code,
+                         symbol_table, c)
         out = ILValue(point.ctype)
         il_code.add(math_cmds.Add(out, point, shift))
         return IndirectLValue(out)

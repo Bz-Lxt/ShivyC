@@ -6,7 +6,7 @@ import shivyc.il_cmds.value as value_cmds
 from shivyc.errors import CompilerError
 from shivyc.il_gen import ILValue
 from shivyc.tree.expr_base import _RExprNode
-from shivyc.tree.utils import set_type, shift_into_range
+from shivyc.tree.utils import (set_type, shift_into_range, sizeof_ctype)
 
 
 class _IncrDecr(_RExprNode):
@@ -34,7 +34,14 @@ class _IncrDecr(_RExprNode):
         if val.ctype.is_arith():
             il_code.register_literal_var(one, 1)
         elif val.ctype.is_pointer() and val.ctype.arg.is_complete():
-            il_code.register_literal_var(one, val.ctype.arg.size)
+            if val.ctype.arg.is_vla():
+                # The size of the pointed-to variable length array is a
+                # runtime value.
+                size = sizeof_ctype(
+                    val.ctype.arg, il_code, symbol_table, c)
+                il_code.add(value_cmds.Set(one, size))
+            else:
+                il_code.register_literal_var(one, val.ctype.arg.size)
         elif val.ctype.is_pointer():
             # technically, this message is not quite right because for
             # non-object types, a type can be neither complete nor incomplete
