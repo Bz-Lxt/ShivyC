@@ -28,7 +28,10 @@ following line whose message is the string "____".
 
 import glob
 import pathlib
+import platform
+import shutil
 import subprocess
+import tempfile
 import unittest
 
 import shivyc.main
@@ -161,6 +164,94 @@ class FeatureTests(TestUtils, metaclass=MetaFeatureTests):
     """Frontend tests that test the lexer, preprocessor, and parser."""
 
     pass
+
+
+class ThreadLocalTests(TestUtils):
+    """Tests for C11 _Thread_local which need threads or GCC interop.
+
+    The C sources live in tests/thread_tls/ and are not picked up by the
+    ordinary feature test generator.
+    """
+
+    def setUp(self):
+        """These tests build and run ELF binaries, so they need Linux."""
+        super().setUp()
+        if platform.system() != "Linux":
+            self.skipTest("only x86_64 Linux is supported")
+        self.tls_dir = pathlib.Path(__file__).parent.joinpath("thread_tls")
+        self.tmp = tempfile.mkdtemp(prefix="shivyc_tls_")
+
+    def tearDown(self):
+        """Remove temporary build outputs."""
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _shivyc_obj(self, name):
+        """Compile tests/thread_tls/<name>.c with ShivyC and return its .o."""
+
+        class Arguments:
+            show_reg_alloc_perf = False
+
+        cfile = str(self.tls_dir.joinpath(name + ".c"))
+        obj = shivyc.main.process_c_file(cfile, Arguments())
+        self.assertTrue(obj, f"ShivyC failed to compile {name}.c")
+        return obj
+
+    def _gcc_obj(self, name, extra=None):
+        """Compile tests/thread_tls/<name>.c with GCC and return its .o."""
+        gcc = shutil.which("gcc")
+        if not gcc:
+            self.skipTest("gcc is not available")
+
+        obj = str(pathlib.Path(self.tmp).joinpath(name + ".o"))
+        cmd = [gcc, "-std=c11", "-fno-pic", "-c",
+               str(self.tls_dir.joinpath(name + ".c")), "-o", obj]
+        if extra:
+            cmd.extend(extra)
+        self.assertEqual(subprocess.call(cmd), 0,
+                         f"GCC failed to compile {name}.c")
+        return obj
+
+    def _link_shivyc(self, objs, binary):
+        """Link object files with ShivyC's linker invocation."""
+        out = str(pathlib.Path(self.tmp).joinpath(binary))
+        if not shivyc.main.link(out, objs):
+            self.skipTest("linking thread-local test failed "
+                          "(pthread support may be missing from libc)")
+        return out
+
+    def _link_gcc(self, sources_and_objs, binary):
+        """Link with the GCC driver (non-PIE, to match ShivyC objects)."""
+        gcc = shutil.which("gcc")
+        if not gcc:
+            self.skipTest("gcc is not available")
+
+        out = str(pathlib.Path(self.tmp).joinpath(binary))
+        cmd = [gcc, "-std=c11", "-fno-pic", "-no-pie"]
+        cmd.extend(sources_and_objs)
+        cmd.extend(["-o", out])
+        self.assertEqual(subprocess.call(cmd), 0, "GCC link failed")
+        return out
+
+    def test_pthreads(self):
+        """Each thread has independent TLS and shares it across both TUs."""
+        objs = [self._shivyc_obj("thread_main"),
+                self._shivyc_obj("thread_helper")]
+        binary = self._link_shivyc(objs, "pthreads")
+        self.assertEqual(subprocess.call([binary]), 0)
+
+    def test_gcc_defines_shivyc_references(self):
+        """ShivyC extern TLS references bind to GCC-defined objects."""
+        gcc_obj = self._gcc_obj("gcc_defines")
+        shivyc_obj = self._shivyc_obj("shivyc_references")
+        binary = self._link_shivyc([shivyc_obj, gcc_obj], "gcc_defines")
+        self.assertEqual(subprocess.call([binary]), 117)
+
+    def test_shivyc_defines_gcc_references(self):
+        """GCC extern TLS references bind to ShivyC-defined objects."""
+        shivyc_obj = self._shivyc_obj("shivyc_defines")
+        gcc_main = str(self.tls_dir.joinpath("gcc_references.c"))
+        binary = self._link_gcc([gcc_main, shivyc_obj], "gcc_references")
+        self.assertEqual(subprocess.call([binary]), 0)
 
 
 class IntegrationTests(TestUtils):

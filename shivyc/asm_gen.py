@@ -5,6 +5,9 @@ import itertools
 import shivyc.asm_cmds as asm_cmds
 import shivyc.spots as spots
 from shivyc.spots import Spot, RegSpot, MemSpot, LiteralSpot
+from shivyc.il_cmds.control import Call
+from shivyc.il_cmds.value import AddrOf, AddrRel
+from shivyc.il_cmds.math import _BitShiftCmd, _DivMod
 
 
 class ASMCode:
@@ -22,6 +25,8 @@ class ASMCode:
         self.comm = []
         self.globals = []
         self.data = []
+        self.tdata = []
+        self.tbss = []
         self.string_literals = []
 
     def add(self, cmd):
@@ -70,6 +75,30 @@ class ASMCode:
             self.comm.append(f"\t.local {name}")
         self.comm.append(f"\t.comm {name} {size}")
 
+    def add_tls(self, name, size, init, external):
+        """Add a defined thread-local object.
+
+        It goes in .tdata if it has a nonzero constant initializer, and
+        in .tbss otherwise.
+
+        name (str) - Assembly name of the symbol
+        size (int) - Size in bytes
+        init (int or None) - Constant initializer, or None if uninitialized
+        external (bool) - Whether the symbol has external linkage
+        """
+        lines = self.tdata if init else self.tbss
+        if external:
+            lines.append(f"\t.global {name}")
+        else:
+            lines.append(f"\t.local {name}")
+
+        lines.append(f"{name}:")
+        size_strs = {1: "byte", 2: "word", 4: "int", 8: "quad"}
+        if init:
+            lines.append(f"\t.{size_strs[size]} {init}")
+        else:
+            lines.append(f"\t.zero {size}")
+
     def add_string_literal(self, name, chars):
         """Add a string literal to the ASM code."""
         self.string_literals.append(f"{name}:")
@@ -89,6 +118,16 @@ class ASMCode:
             header += ["\t.section .data"]
             header += self.data
             header += self.string_literals
+            header += [""]
+
+        if self.tdata:
+            header += ["\t.section\t.tdata,\"awT\",@progbits"]
+            header += self.tdata
+            header += [""]
+
+        if self.tbss:
+            header += ["\t.section\t.tbss,\"awT\",@nobits"]
+            header += self.tbss
             header += [""]
 
         header += ["\t.section .text"] + self.globals
@@ -455,6 +494,7 @@ class ASMGen:
         EXTERNAL = self.symbol_table.EXTERNAL
         INTERNAL = self.symbol_table.INTERNAL
         TENTATIVE = self.symbol_table.TENTATIVE
+        THREAD = self.symbol_table.THREAD
 
         if v in self.il_code.literals:
             return LiteralSpot(self.il_code.literals[v])
@@ -465,9 +505,40 @@ class ASMGen:
                 name, self.il_code.string_literals[v])
             return MemSpot(name)
 
+        # A thread-local object which is only declared, not defined, in this
+        # translation unit. The Initial Exec model resolves it through the
+        # GOT entry produced by the linker.
+        elif (self.symbol_table.thread.get(v)
+              and not self.symbol_table.storage.get(v, None)):
+            return spots.TLSMemSpot(self.symbol_table.names[v], "IE")
+
         # Values with no storage can be referenced directly by name
         elif not self.symbol_table.storage.get(v, True):
             return MemSpot(self.symbol_table.names[v])
+
+        elif self.symbol_table.storage.get(v) == THREAD:
+            linkage = self.symbol_table.linkage_type.get(v)
+            external = linkage == EXTERNAL
+
+            name = self.symbol_table.names[v]
+            if not external:
+                # Rename symbols with internal or no linkage so they can
+                # never clash with anything from another translation unit.
+                name = f"{name}.{num}"
+
+            # A tentative definition of a thread-local object is emitted as
+            # an ordinary zero-initialized definition in .tbss, just like
+            # GCC does. As in GCC, defining the same object tentatively in
+            # another translation unit is a multiple-definition error at
+            # link time.
+            init_val = self.il_code.static_inits.get(v, None)
+            self.asm_code.add_tls(
+                name, v.ctype.size, init_val, external)
+
+            # The executable's own definitions always use the Local Exec
+            # model; the static linker resolves the TPOFF directly, even for
+            # symbols with external linkage, exactly as it does for GCC.
+            return spots.TLSMemSpot(name, "LE")
 
         elif self.symbol_table.storage.get(v) == self.symbol_table.STATIC:
             name = self.symbol_table.names[v]
@@ -804,21 +875,33 @@ class ASMGen:
         for i, command in enumerate(commands):
             self.asm_code.add(asm_cmds.Comment(type(command).__name__.upper()))
 
-            def get_reg(pref=None, conf=None):
+            # Registers currently holding TPOFFs of Initial Exec thread-local
+            # variables for this command. The get_reg closure is made aware
+            # of them so command-emitted code cannot clobber one.
+            tls_regs = []
+
+            def get_reg(pref=None, conf=None, strict=False):
                 if not pref: pref = []
                 if not conf: conf = []
 
-                # Spot is bad if it is containing a variable that is live both
-                # entering and exiting this command.
-                bad_vars = set(live_vars[i][0]) & set(live_vars[i][1])
+                # Normally a spot is bad only if it holds a variable live
+                # both entering and exiting this command. Scratch registers
+                # loaded before the command starts (e.g. thread-local TPOFF
+                # registers) must not clobber any live-in spot at all.
+                if strict:
+                    bad_vars = set(live_vars[i][0])
+                else:
+                    bad_vars = set(live_vars[i][0]) & set(live_vars[i][1])
                 bad_spots = set(spotmap[var] for var in bad_vars)
 
                 # Spot is free if it is where an output is stored.
                 for v in command.outputs():
                     bad_spots.discard(spotmap[v])
 
-                # Spot is bad if it is listed as a conflicting spot.
+                # Spot is bad if it is listed as a conflicting spot, or if
+                # it holds a thread-local TPOFF needed by this command.
                 bad_spots |= set(conf)
+                bad_spots |= set(tls_regs)
 
                 for s in (pref + self.all_registers):
                     if isinstance(s, RegSpot) and s not in bad_spots:
@@ -826,4 +909,265 @@ class ASMGen:
 
                 raise NotImplementedError("spill required for get_reg")
 
-            command.make_asm(spotmap, spotmap, get_reg, self.asm_code)
+            # Taking the address of a thread-local object produces an
+            # ordinary linear pointer, so this is handled specially.
+            if (isinstance(command, AddrOf)
+                    and isinstance(spotmap.get(command.var),
+                                   spots.TLSMemSpot)):
+                self._make_addr_of_asm(command, spotmap, get_reg)
+            elif (isinstance(command, AddrRel)
+                    and isinstance(spotmap.get(command.base),
+                                   spots.TLSMemSpot)):
+                self._make_addr_rel_asm(command, spotmap, get_reg)
+            # Calls need special handling because a TPOFF loaded for the
+            # return value would not survive the call itself.
+            elif isinstance(command, Call):
+                self._make_call_asm(command, spotmap, get_reg, tls_regs)
+            else:
+                tls_spotmap = self._resolve_tls_spots(
+                    command, spotmap, get_reg, tls_regs)
+                command.make_asm(tls_spotmap, tls_spotmap, get_reg,
+                                 self.asm_code)
+
+    def _resolve_tls_spots(self, command, spotmap, get_reg, tls_regs):
+        """Resolve thread-local spots referenced by command.
+
+        Local Exec operands need no register at all: they are replaced by
+        spots which render directly as fs:-relative references. Initial
+        Exec operands require loading the TPOFF from the GOT into a
+        register, which is then used inside an fs: segment override.
+
+        The TPOFF-holding registers are tracked in tls_regs so that the
+        command's own code cannot overwrite them.
+        """
+        # Some commands write fixed registers while their operands are still
+        # being read, so such registers cannot hold a TPOFF.
+        forbidden = set()
+        if isinstance(command, _BitShiftCmd):
+            forbidden.add(spots.RCX)
+        if isinstance(command, _DivMod):
+            forbidden |= {spots.RAX, spots.RDX}
+
+        # The TPOFF register must also differ from any register output of
+        # this command. Otherwise the access aliases its base and its
+        # destination (or written value), as in `mov ecx, DWORD PTR
+        # fs:[rcx]`, which is legal hardware-wise but is translated
+        # incorrectly by some x86_64 emulators.
+        for v in command.outputs():
+            if v is not None and isinstance(spotmap.get(v), RegSpot):
+                forbidden.add(spotmap[v])
+
+        # Collect the distinct TLS spots this command touches. Inputs and
+        # outputs are scanned directly because some commands (e.g. the
+        # relative commands) do not list every operand through references().
+        tls_spots = []
+        for v in command.inputs() + command.outputs():
+            if v is None:
+                continue
+            spot = spotmap.get(v)
+            if isinstance(spot, spots.TLSMemSpot) and spot not in tls_spots:
+                tls_spots.append(spot)
+
+        tls_spotmap = dict(spotmap)
+
+        for tls_spot in tls_spots:
+            if tls_spot.model == "LE":
+                resolved = spots.TLSLESpot(tls_spot.name)
+            elif tls_spot.model == "IE":
+                reg = get_reg(conf=tls_regs + list(forbidden), strict=True)
+                tls_regs.append(reg)
+                self.asm_code.add(
+                    asm_cmds.Mov(reg, spots.GOTTPOFFSpot(tls_spot.name), 8))
+                resolved = spots.TLSIESpot(reg)
+            else:
+                raise NotImplementedError(
+                    f"unknown TLS model '{tls_spot.model}'")
+
+            for v in command.inputs() + command.outputs():
+                if v is not None and spotmap.get(v) == tls_spot:
+                    tls_spotmap[v] = resolved
+
+        return tls_spotmap
+
+    def _make_addr_of_asm(self, command, spotmap, get_reg):
+        """Emit an AddrOf command for a thread-local variable.
+
+        The result is an ordinary linear pointer and can be passed around
+        like any other address.
+        """
+        tls_spot = spotmap[command.var]
+        out_spot = spotmap[command.output]
+
+        out_in_reg = isinstance(out_spot, RegSpot)
+
+        if tls_spot.model == "LE":
+            if out_in_reg:
+                addr_reg = out_spot
+                tp_reg = get_reg(conf=[addr_reg], strict=True)
+                self.asm_code.add(
+                    asm_cmds.Mov(tp_reg, spots.TPBaseSpot(), 8))
+                self.asm_code.add(
+                    asm_cmds.Lea(addr_reg,
+                                 spots.TLSLEAddrSpot(tls_spot.name, tp_reg)))
+            else:
+                addr_reg = get_reg(strict=True)
+                tp_reg = get_reg(conf=[addr_reg], strict=True)
+                self.asm_code.add(
+                    asm_cmds.Mov(tp_reg, spots.TPBaseSpot(), 8))
+                self.asm_code.add(
+                    asm_cmds.Lea(addr_reg,
+                                 spots.TLSLEAddrSpot(tls_spot.name, tp_reg)))
+                self.asm_code.add(
+                    asm_cmds.Mov(out_spot, addr_reg,
+                                 command.output.ctype.size))
+        elif tls_spot.model == "IE":
+            if out_in_reg:
+                addr_reg = out_spot
+            else:
+                addr_reg = get_reg(strict=True)
+
+            tp_reg = get_reg(conf=[addr_reg], strict=True)
+            self.asm_code.add(
+                asm_cmds.Mov(addr_reg, spots.GOTTPOFFSpot(tls_spot.name), 8))
+            self.asm_code.add(
+                asm_cmds.Mov(tp_reg, spots.TPBaseSpot(), 8))
+            self.asm_code.add(asm_cmds.Add(addr_reg, tp_reg, 8))
+
+            if not out_in_reg:
+                self.asm_code.add(
+                    asm_cmds.Mov(out_spot, addr_reg,
+                                 command.output.ctype.size))
+        else:
+            raise NotImplementedError(
+                f"unknown TLS model '{tls_spot.model}'")
+
+    def _make_addr_rel_asm(self, command, spotmap, get_reg):
+        """Emit an AddrRel command for a thread-local base.
+
+        Produces an ordinary linear pointer to an element or member of a
+        thread-local object, following the forms used by GCC.
+        """
+        tls_spot = spotmap[command.base]
+        out_spot = spotmap[command.output]
+        out_in_reg = isinstance(out_spot, RegSpot)
+        out_r = out_spot if out_in_reg else get_reg(strict=True)
+
+        # Resolve the count register, or fold a literal count into the
+        # constant displacement.
+        count_r = None
+        if command.count:
+            disp = 0
+            cspot = spotmap[command.count]
+            if isinstance(cspot, LiteralSpot):
+                disp = command.chunk * int(cspot.value)
+            elif isinstance(cspot, RegSpot):
+                count_r = cspot
+            else:
+                count_r = get_reg(conf=[out_r], strict=True)
+                self.asm_code.add(
+                    asm_cmds.Mov(count_r, cspot,
+                                 command.count.ctype.size))
+        else:
+            disp = command.chunk
+
+        # The second lea below indexes by count_r while accumulating into
+        # out_r, so count_r must be a distinct register.
+        if count_r == out_r:
+            count_r = get_reg(conf=[out_r], strict=True)
+            self.asm_code.add(
+                asm_cmds.Mov(count_r, spotmap[command.count],
+                             command.count.ctype.size))
+
+        if tls_spot.model == "LE":
+            tp_reg = get_reg(conf=[out_r, count_r], strict=True)
+            self.asm_code.add(
+                asm_cmds.Mov(tp_reg, spots.TPBaseSpot(), 8))
+            self.asm_code.add(
+                asm_cmds.Lea(out_r,
+                             spots.TLSLEAddrSpot(tls_spot.name, tp_reg, disp)))
+            if count_r:
+                self.asm_code.add(
+                    asm_cmds.Lea(
+                        out_r, MemSpot(out_r, 0, command.chunk, count_r)))
+        elif tls_spot.model == "IE":
+            tp_reg = get_reg(conf=[out_r, count_r], strict=True)
+            got_reg = get_reg(conf=[out_r, tp_reg, count_r], strict=True)
+            self.asm_code.add(
+                asm_cmds.Mov(got_reg, spots.GOTTPOFFSpot(tls_spot.name), 8))
+            self.asm_code.add(
+                asm_cmds.Mov(tp_reg, spots.TPBaseSpot(), 8))
+            self.asm_code.add(
+                asm_cmds.Lea(out_r, MemSpot(got_reg, disp, 1, tp_reg)))
+            if count_r:
+                self.asm_code.add(
+                    asm_cmds.Lea(
+                        out_r, MemSpot(out_r, 0, command.chunk, count_r)))
+        else:
+            raise NotImplementedError(
+                f"unknown TLS model '{tls_spot.model}'")
+
+        if not out_in_reg:
+            self.asm_code.add(
+                asm_cmds.Mov(out_spot, out_r, command.output.ctype.size))
+
+    def _make_call_asm(self, command, spotmap, get_reg, tls_regs):
+        """Emit a Call command with thread-local arguments or return value.
+
+        Local Exec arguments need no register at all. Initial Exec argument
+        TPOFFs are loaded before arguments are marshalled, using registers
+        distinct from all argument registers. A thread-local return value
+        is written only after the call returns.
+        """
+        tls_spotmap = dict(spotmap)
+
+        # A TPOFF register must never be an argument register or hold the
+        # function pointer.
+        func_spot = spotmap[command.func]
+        forbidden = list(command.arg_regs[0:len(command.args)])
+        if isinstance(func_spot, RegSpot):
+            forbidden.append(func_spot)
+
+        for arg in command.args:
+            arg_spot = spotmap.get(arg)
+            if isinstance(arg_spot, spots.TLSMemSpot):
+                if arg_spot.model == "LE":
+                    tls_spotmap[arg] = spots.TLSLESpot(arg_spot.name)
+                elif arg_spot.model == "IE":
+                    reg = get_reg(conf=tls_regs + forbidden, strict=True)
+                    tls_regs.append(reg)
+                    self.asm_code.add(
+                        asm_cmds.Mov(reg, spots.GOTTPOFFSpot(arg_spot.name),
+                                     8))
+                    tls_spotmap[arg] = spots.TLSIESpot(reg)
+                else:
+                    raise NotImplementedError(
+                        f"unknown TLS model '{arg_spot.model}'")
+
+        ret_tls_spot = None
+        if not command.void_return:
+            ret_spot = spotmap.get(command.ret)
+            if isinstance(ret_spot, spots.TLSMemSpot):
+                ret_tls_spot = ret_spot
+                # Make Call.make_asm skip its own move of RAX into the
+                # thread-local return variable; it is emitted below, after
+                # the call returns.
+                tls_spotmap[command.ret] = spots.RAX
+
+        command.make_asm(tls_spotmap, tls_spotmap, get_reg, self.asm_code)
+
+        if ret_tls_spot:
+            size = command.func.ctype.arg.ret.size
+            if ret_tls_spot.model == "LE":
+                self.asm_code.add(
+                    asm_cmds.Mov(spots.TLSLESpot(ret_tls_spot.name),
+                                 spots.RAX, size))
+            elif ret_tls_spot.model == "IE":
+                reg = get_reg(conf=[spots.RAX])
+                self.asm_code.add(
+                    asm_cmds.Mov(reg,
+                                 spots.GOTTPOFFSpot(ret_tls_spot.name), 8))
+                self.asm_code.add(
+                    asm_cmds.Mov(spots.TLSIESpot(reg), spots.RAX, size))
+            else:
+                raise NotImplementedError(
+                    f"unknown TLS model '{ret_tls_spot.model}'")

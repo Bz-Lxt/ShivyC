@@ -60,7 +60,7 @@ class SizeofType(_SizeofNode, Declaration):
         """Return a compile-time integer literal as the expression size."""
 
         self.set_self_vars(il_code, symbol_table, c)
-        base_type, _ = self.make_specs_ctype(self.node.specs, False)
+        base_type, _, _ = self.make_specs_ctype(self.node.specs, False)
         ctype, _ = self.make_ctype(self.node.decls[0], base_type)
         return self.sizeof_ctype(ctype, self.node.decls[0].r, il_code)
 
@@ -82,7 +82,7 @@ class Cast(Declaration, _RExprNode):
         """Make IL for this cast operation."""
 
         self.set_self_vars(il_code, symbol_table, c)
-        base_type, _ = self.make_specs_ctype(self.node.specs, False)
+        base_type, _, _ = self.make_specs_ctype(self.node.specs, False)
         ctype, _ = self.make_ctype(self.node.decls[0], base_type)
 
         if not ctype.is_void() and not ctype.is_scalar():

@@ -163,7 +163,8 @@ def parse_decl_specifiers(index, _spec_qual=False):
     type_quals = {token_kinds.const_kw}
 
     storage_specs = {token_kinds.auto_kw, token_kinds.static_kw,
-                     token_kinds.extern_kw, token_kinds.typedef_kw}
+                     token_kinds.extern_kw, token_kinds.typedef_kw,
+                     token_kinds.thread_local_kw}
 
     specs = []
 

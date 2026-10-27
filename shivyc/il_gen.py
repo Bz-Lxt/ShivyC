@@ -163,6 +163,7 @@ class SymbolTable:
     # Storage durations
     STATIC = 1
     AUTOMATIC = 2
+    THREAD = 3
 
     def __init__(self):
         """Initialize symbol table.
@@ -185,8 +186,12 @@ class SymbolTable:
         self.def_state = {}
 
         # Store variable storage durations
-        # ILValue -> STATIC/AUTOMATIC/None
+        # ILValue -> STATIC/AUTOMATIC/THREAD/None
         self.storage = {}
+
+        # Store whether an ILValue was declared _Thread_local
+        # ILValue -> bool
+        self.thread = {}
 
         # Store the names of all IL values.
         # ILValue -> name
@@ -236,14 +241,16 @@ class SymbolTable:
         """
         return self.linkage_type.get(self._lookup_raw(identifier.content))
 
-    def add_variable(self, identifier, ctype, defined, linkage, storage):
+    def add_variable(self, identifier, ctype, defined, linkage, storage,
+                     thread_local=False):
         """Add an identifier with the given name and type to the symbol table.
 
         identifier (Token) - Identifier to add, for error purposes.
         ctype (CType) - C type of the identifier we're adding.
         defined - one of DEFINED, UNDEFINED, or TENTATIVE
         linkage - one of INTERNAL, EXTERNAL, or None
-        storage - STATIC, AUTOMATIC, or None
+        storage - STATIC, AUTOMATIC, THREAD, or None
+        thread_local - whether this declaration carries _Thread_local
 
         return (ILValue) - the ILValue added
         """
@@ -274,6 +281,18 @@ class SymbolTable:
             # completed an object type)
             var.ctype = ctype
 
+        # Verify the _Thread_local specification matches any earlier
+        # declaration of this object. See C11 6.2.2 and 6.7.1.
+        old_thread = self.thread.get(var)
+        if old_thread is not None and old_thread != thread_local:
+            if thread_local:
+                err = ("thread-local declaration follows non-thread-local "
+                       f"declaration of '{name}'")
+            else:
+                err = ("non-thread-local declaration follows thread-local "
+                       f"declaration of '{name}'")
+            raise CompilerError(err, identifier.r)
+
         self.tables[-1].vars[name] = var
 
         # Set this variable's linkage if it has one
@@ -288,6 +307,7 @@ class SymbolTable:
         if not self.storage.get(var, None):
             self.storage[var] = storage
 
+        self.thread[var] = thread_local
         self.names[var] = name
         return var
 

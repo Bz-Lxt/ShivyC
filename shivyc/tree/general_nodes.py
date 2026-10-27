@@ -97,7 +97,8 @@ class DeclInfo:
     TYPEDEF = 4
 
     def __init__(self, identifier, ctype, range,
-                 storage=None, init=None, body=None, param_names=None):
+                 storage=None, init=None, body=None, param_names=None,
+                 thread_local=False):
         self.identifier = identifier
         self.ctype = ctype
         self.range = range
@@ -105,6 +106,9 @@ class DeclInfo:
         self.init = init
         self.body = body
         self.param_names = param_names
+
+        # Whether the _Thread_local specifier was present
+        self.thread_local = thread_local
 
     def process(self, il_code, symbol_table, c):
         """Process given DeclInfo object.
@@ -118,8 +122,21 @@ class DeclInfo:
 
         # The typedef is special
         if self.storage == self.TYPEDEF:
+            if self.thread_local:
+                err = "'_Thread_local' cannot be used with 'typedef'"
+                raise CompilerError(err, self.range)
             self.process_typedef(symbol_table)
             return
+
+        if self.thread_local and self.ctype.is_function():
+            err = "'_Thread_local' specified for function"
+            raise CompilerError(err, self.range)
+
+        if (self.thread_local and not c.is_global
+              and self.storage not in {self.STATIC, self.EXTERN}):
+            err = ("'_Thread_local' variable at block scope must be "
+                   "'static' or 'extern'")
+            raise CompilerError(err, self.range)
 
         if self.body and not self.ctype.is_function():
             err = "function definition provided for non-function type"
@@ -138,7 +155,8 @@ class DeclInfo:
             self.ctype,
             defined,
             linkage,
-            storage)
+            storage,
+            self.thread_local)
 
         if self.init:
             self.do_init(var, storage, il_code, symbol_table, c)
@@ -170,19 +188,37 @@ class DeclInfo:
         # little bit hacky, but will be fixed when full initializers are
         # implemented shortly
 
-        init = self.init.make_il(il_code, symbol_table, c)
-        if storage == symbol_table.STATIC and not init.literal:
-            err = ("non-constant initializer for variable with static "
-                   "storage duration")
-            raise CompilerError(err, self.init.r)
-        elif storage == symbol_table.STATIC:
+        static_storage = storage in {symbol_table.STATIC,
+                                     symbol_table.THREAD}
+        if static_storage:
+            # A static or thread-local initializer must be a constant
+            # expression, so no IL commands may be emitted for it. Divert
+            # any commands the initializer tries to emit into a temporary
+            # list so that a non-constant initializer is reported as a
+            # proper error instead of corrupting the surrounding IL code.
+            prev_commands = il_code.commands.get(il_code.cur_func)
+            il_code.commands[il_code.cur_func] = []
+
+            init = self.init.make_il(il_code, symbol_table, c)
+
+            if prev_commands is None:
+                del il_code.commands[il_code.cur_func]
+            else:
+                il_code.commands[il_code.cur_func] = prev_commands
+
+            if not init.literal:
+                err = ("non-constant initializer for variable with static "
+                       "storage duration")
+                raise CompilerError(err, self.init.r)
             il_code.static_initialize(var, getattr(init.literal, "val", None))
-        elif var.ctype.is_arith() or var.ctype.is_pointer():
-            lval = DirectLValue(var)
-            lval.set_to(init, il_code, self.identifier.r)
         else:
-            err = "declared variable is not of assignable type"
-            raise CompilerError(err, self.range)
+            init = self.init.make_il(il_code, symbol_table, c)
+            if var.ctype.is_arith() or var.ctype.is_pointer():
+                lval = DirectLValue(var)
+                lval.set_to(init, il_code, self.identifier.r)
+            else:
+                err = "declared variable is not of assignable type"
+                raise CompilerError(err, self.range)
 
     def do_body(self, il_code, symbol_table, c):
         """Create code for function body.
@@ -285,6 +321,8 @@ class DeclInfo:
         """Determine the storage duration."""
         if defined == symbol_table.UNDEFINED or not self.ctype.is_object():
             storage = None
+        elif self.thread_local:
+            storage = symbol_table.THREAD
         elif linkage or self.storage == self.STATIC:
             storage = symbol_table.STATIC
         else:
@@ -331,7 +369,8 @@ class Declaration(Node):
         """Given a node, returns a list of decl_info objects for that node."""
 
         any_dec = bool(node.decls)
-        base_type, storage = self.make_specs_ctype(node.specs, any_dec)
+        base_type, storage, thread_local = self.make_specs_ctype(
+            node.specs, any_dec)
 
         out = []
         for decl, init in zip(node.decls, node.inits):
@@ -345,7 +384,7 @@ class Declaration(Node):
 
                 out.append(DeclInfo(
                     identifier, ctype, decl.r, storage, init,
-                    self.body, param_identifiers))
+                    self.body, param_identifiers, thread_local))
 
         return out
 
@@ -397,7 +436,7 @@ class Declaration(Node):
         # Prohibit storage class specifiers in parameters.
         for param in decl.args:
             decl_info = self.get_decl_infos(param)[0]
-            if decl_info.storage:
+            if decl_info.storage or decl_info.thread_local:
                 err = "storage class specified for function parameter"
                 raise CompilerError(err, decl_info.range)
 
@@ -478,6 +517,8 @@ class Declaration(Node):
         """
         spec_range = specs[0].r + specs[-1].r
         storage = self.get_storage([spec.kind for spec in specs], spec_range)
+        thread_local = self.get_thread_local(
+            [spec.kind for spec in specs], spec_range)
         const = token_kinds.const_kw in {spec.kind for spec in specs}
 
         struct_union_specs = {token_kinds.struct_kw, token_kinds.union_kw}
@@ -498,7 +539,7 @@ class Declaration(Node):
             base_type = self.get_base_ctype(specs, spec_range)
 
         if const: base_type = base_type.make_const()
-        return base_type, storage
+        return base_type, storage, thread_local
 
     def get_base_ctype(self, specs, spec_range):
         """Return a base ctype given a list of specs."""
@@ -553,6 +594,10 @@ class Declaration(Node):
     def get_storage(self, spec_kinds, spec_range):
         """Determine the storage class from given specifier token kinds.
 
+        The _Thread_local specifier is ignored here because it describes
+        storage duration rather than a storage class, and is handled
+        separately by get_thread_local.
+
         If no storage class is listed, returns None.
         """
         storage_classes = {token_kinds.auto_kw: DeclInfo.AUTO,
@@ -569,6 +614,17 @@ class Declaration(Node):
                 raise CompilerError(descrip, spec_range)
 
         return storage
+
+    def get_thread_local(self, spec_kinds, spec_range):
+        """Determine whether _Thread_local is in given specifier kinds.
+
+        Raises an error if _Thread_local is listed more than once.
+        """
+        count = spec_kinds.count(token_kinds.thread_local_kw)
+        if count > 1:
+            descrip = "'_Thread_local' specified more than once"
+            raise CompilerError(descrip, spec_range)
+        return count == 1
 
     def parse_struct_union_spec(self, node, redec):
         """Parse struct or union ctype from the given decl_nodes.Struct node.
@@ -648,6 +704,10 @@ class Declaration(Node):
 
         if decl_info.storage is not None:
             err = f"cannot have storage specifier on {kind} member"
+            raise CompilerError(err, decl_info.range)
+
+        if decl_info.thread_local:
+            err = f"cannot have '_Thread_local' on {kind} member"
             raise CompilerError(err, decl_info.range)
 
         if decl_info.ctype.is_function():

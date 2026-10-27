@@ -208,6 +208,183 @@ class LiteralSpot(Spot):
         return str(self.value)
 
 
+class TLSMemSpot(MemSpot):
+    """Marker spot for a variable in thread-local storage.
+
+    This kind of spot can never be rendered directly into assembly. Before a
+    command is emitted, every TLS spot is replaced by either a TLSLESpot (for
+    symbols local to this executable, accessed directly through the thread
+    pointer) or a TLSIESpot (for symbols which may be defined in another
+    dynamically-linked object, accessed through a GOT entry).
+
+    name (str) - Assembly symbol of the thread-local variable
+    model (str) - "LE" for the Local Exec model or "IE" for Initial Exec
+    """
+
+    def __init__(self, name, model):  # noqa D102
+        super().__init__(name)
+        self.name = name
+        self.model = model
+        self.detail = (name, model)
+
+    def asm_str(self, size):  # noqa D102
+        raise NotImplementedError(
+            "TLS memory spot was not resolved to a runtime address")
+
+    def shift(self, chunk, count=None):  # noqa D102
+        raise NotImplementedError(
+            "TLS memory spot must be resolved before it is shifted")
+
+
+class _TLSOperandSpot(MemSpot):
+    """Common machinery for resolved thread-local operand spots.
+
+    These render like memory operands but with an fs: segment override, so
+    that every access is relative to the current thread's thread pointer.
+    The `offset`, `chunk`, and `count` fields mirror MemSpot semantics.
+    """
+
+    def __init__(self, detail, offset=0, chunk=0, count=None):  # noqa D102
+        Spot.__init__(self, detail + (offset, chunk, count))
+        self.offset = offset
+        self.chunk = chunk
+        self.count = count
+
+    def _index_part(self):
+        """Render the count*chunk part of an indexed operand."""
+        if self.chunk > 0:
+            return f"+{self.count.asm_str(8)}*{self.chunk}"
+        elif self.chunk < 0:
+            return f"-{self.count.asm_str(8)}*{-self.chunk}"
+        return ""
+
+    def shift(self, chunk, count=None):  # noqa D102
+        if count and self.count:
+            raise NotImplementedError("cannot shift TLS spot by two counts")
+        return self._shifted(chunk, count)
+
+
+class TLSLESpot(_TLSOperandSpot):
+    """Resolved Local Exec thread-local operand.
+
+    Renders as a direct fs:-relative reference to a link-time constant TPOFF,
+    e.g. `DWORD PTR fs:counter@tpoff+4` or
+         `DWORD PTR fs:arr@tpoff[0+rcx*4]`.
+    """
+
+    def __init__(self, name, offset=0, chunk=0, count=None):  # noqa D102
+        super().__init__(("LE", name), offset, chunk, count)
+        self.name = name
+
+    def _shifted(self, chunk, count):
+        if count:
+            return TLSLESpot(self.name, self.offset + self.chunk,
+                             chunk, count)
+        return TLSLESpot(self.name, self.offset + chunk,
+                         self.chunk, self.count)
+
+    def asm_str(self, size):  # noqa D102
+        size_desc = MemSpot.size_map.get(size, "")
+        if self.count:
+            return (f"{size_desc}fs:{self.name}@tpoff"
+                    f"[{self.offset}{self._index_part()}]")
+        elif self.offset > 0:
+            return f"{size_desc}fs:{self.name}@tpoff+{self.offset}"
+        elif self.offset < 0:
+            return f"{size_desc}fs:{self.name}@tpoff-{-self.offset}"
+        else:
+            return f"{size_desc}fs:{self.name}@tpoff"
+
+
+class TLSIESpot(_TLSOperandSpot):
+    """Resolved Initial Exec thread-local operand.
+
+    `base` is a register holding the TPOFF loaded from the symbol's GOT
+    entry. Renders as e.g. `DWORD PTR fs:[rax]` or
+    `DWORD PTR fs:[rax+0+rcx*4]`.
+    """
+
+    def __init__(self, base, offset=0, chunk=0, count=None):  # noqa D102
+        super().__init__(("IE", base), offset, chunk, count)
+        self.base = base
+
+    def _shifted(self, chunk, count):
+        if count:
+            return TLSIESpot(self.base, self.offset + self.chunk,
+                             chunk, count)
+        return TLSIESpot(self.base, self.offset + chunk,
+                         self.chunk, self.count)
+
+    def asm_str(self, size):  # noqa D102
+        size_desc = MemSpot.size_map.get(size, "")
+        base_str = self.base.asm_str(0)
+        if self.count:
+            if self.offset:
+                disp = (f"+{self.offset}" if self.offset > 0
+                        else f"-{-self.offset}")
+            else:
+                disp = "+0"
+            return f"{size_desc}fs:[{base_str}{disp}{self._index_part()}]"
+        elif self.offset > 0:
+            return f"{size_desc}fs:[{base_str}+{self.offset}]"
+        elif self.offset < 0:
+            return f"{size_desc}fs:[{base_str}-{-self.offset}]"
+        else:
+            return f"{size_desc}fs:[{base_str}]"
+
+
+class TLSLEAddrSpot(Spot):
+    """Operand for `lea` computing the linear address of an LE TLS object.
+
+    Renders as e.g. `counter@tpoff[rbx]` or `larr@tpoff[rbx+12]`, where rbx
+    holds the thread pointer loaded from fs:0.
+    """
+
+    def __init__(self, name, base, offset=0):  # noqa D102
+        super().__init__((name, base, offset))
+        self.name = name
+        self.base = base
+        self.offset = offset
+
+    def asm_str(self, size):  # noqa D102
+        if self.offset > 0:
+            disp = f"+{self.offset}"
+        elif self.offset < 0:
+            disp = f"-{-self.offset}"
+        else:
+            disp = ""
+        return f"{self.name}@tpoff[{self.base.asm_str(0)}{disp}]"
+
+
+class TPBaseSpot(Spot):
+    """Spot representing the thread pointer stored at fs:0.
+
+    Used when loading the thread pointer into a register, as in
+    `mov rbx, QWORD PTR fs:0`.
+    """
+
+    def __init__(self):  # noqa D102
+        super().__init__("fs:0")
+
+    def asm_str(self, size):  # noqa D102
+        return f"{MemSpot.size_map.get(size, '')}fs:0"
+
+
+class GOTTPOFFSpot(Spot):
+    """RIP-relative GOT slot holding the TPOFF of an IE thread-local symbol.
+
+    Used as the source of a mov, as in `mov rax, name@gottpoff[rip]`.
+    """
+
+    def __init__(self, name):  # noqa D102
+        super().__init__(name)
+        self.name = name
+
+    def asm_str(self, size):  # noqa D102
+        return (f"{MemSpot.size_map.get(size, '')}"
+                f"{self.name}@gottpoff[rip]")
+
+
 # RBX is callee-saved, which is still unsupported
 # RBX = RegSpot("rbx")
 
