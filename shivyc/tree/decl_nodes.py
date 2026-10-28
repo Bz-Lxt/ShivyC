@@ -43,9 +43,12 @@ class Root(DeclNode):
 
     specs (List(Tokens/Nodes)) - list of the declaration specifiers, as tokens
     decls (List(Node)) - list of declarator nodes
+    bitfields (List(Node/None)) - for each declarator, the constant
+    expression node giving its bit-field width, or None if the declarator
+    is not a bit-field. Only populated for struct/union members.
     """
 
-    def __init__(self, specs, decls, inits=None):
+    def __init__(self, specs, decls, inits=None, bitfields=None):
         """Generate root node."""
         self.specs = specs
         self.decls = decls
@@ -54,6 +57,11 @@ class Root(DeclNode):
             self.inits = inits
         else:
             self.inits = [None] * len(self.decls)
+
+        if bitfields:
+            self.bitfields = bitfields
+        else:
+            self.bitfields = [None] * len(self.decls)
 
         super().__init__()
 

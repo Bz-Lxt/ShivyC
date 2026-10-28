@@ -97,7 +97,8 @@ class DeclInfo:
     TYPEDEF = 4
 
     def __init__(self, identifier, ctype, range,
-                 storage=None, init=None, body=None, param_names=None):
+                 storage=None, init=None, body=None, param_names=None,
+                 bitfield=None):
         self.identifier = identifier
         self.ctype = ctype
         self.range = range
@@ -105,6 +106,10 @@ class DeclInfo:
         self.init = init
         self.body = body
         self.param_names = param_names
+
+        # If this is a struct or union bit-field member, this is the width
+        # of the bit-field in bits. It is None otherwise.
+        self.bitfield = bitfield
 
     def process(self, il_code, symbol_table, c):
         """Process given DeclInfo object.
@@ -334,9 +339,15 @@ class Declaration(Node):
         base_type, storage = self.make_specs_ctype(node.specs, any_dec)
 
         out = []
-        for decl, init in zip(node.decls, node.inits):
+        for decl, init, bitfield_node in zip(
+                node.decls, node.inits, node.bitfields):
             with report_err():
                 ctype, identifier = self.make_ctype(decl, base_type)
+
+                bit_width = None
+                if bitfield_node is not None:
+                    bit_width = self.eval_bitfield_width(
+                        bitfield_node, ctype)
 
                 if ctype.is_function():
                     param_identifiers = self.extract_params(decl)
@@ -345,9 +356,49 @@ class Declaration(Node):
 
                 out.append(DeclInfo(
                     identifier, ctype, decl.r, storage, init,
-                    self.body, param_identifiers))
+                    self.body, param_identifiers, bit_width))
 
         return out
+
+    def eval_bitfield_width(self, width_node, field_ctype):
+        """Evaluate a bit-field width expression to a non-negative int.
+
+        The width must be an integral constant expression whose value is
+        non-negative and does not exceed the width of the declared type.
+        Raises CompilerError otherwise.
+        """
+        if not field_ctype.is_integral():
+            err = "bit-field type must be an integer type"
+            raise CompilerError(err, width_node.r)
+
+        # Evaluate the expression in a throwaway IL code object, so no
+        # code generated for it ends up in the final program.
+        dummy_il_code = self.il_code.copy()
+        if dummy_il_code.cur_func not in dummy_il_code.commands:
+            dummy_il_code.commands[dummy_il_code.cur_func] = []
+
+        width_value = width_node.make_il(
+            dummy_il_code, self.symbol_table, self.c)
+
+        if not width_value.ctype.is_integral():
+            err = "bit-field width must have integer type"
+            raise CompilerError(err, width_node.r)
+
+        if not width_value.literal:
+            err = "bit-field width must be a compile-time constant"
+            raise CompilerError(err, width_node.r)
+
+        width = width_value.literal.val
+        if width < 0:
+            err = "bit-field width must be non-negative"
+            raise CompilerError(err, width_node.r)
+
+        max_width = 1 if field_ctype.is_bool() else field_ctype.size * 8
+        if width > max_width:
+            err = "bit-field width exceeds width of its type"
+            raise CompilerError(err, width_node.r)
+
+        return width
 
     def make_ctype(self, decl, prev_ctype):
         """Generate a ctype from the given declaration.
@@ -631,9 +682,15 @@ class Declaration(Node):
                     self._check_struct_member_decl_info(
                         decl_info, node.kind, members_set)
 
-                    name = decl_info.identifier.content
-                    members_set.add(name)
-                    members.append((name, decl_info.ctype))
+                    if decl_info.identifier is not None:
+                        name = decl_info.identifier.content
+                        members_set.add(name)
+                    else:
+                        # This is an unnamed bit-field.
+                        name = None
+
+                    members.append(
+                        (name, decl_info.ctype, decl_info.bitfield))
 
         ctype.set_members(members)
         return ctype
@@ -642,9 +699,11 @@ class Declaration(Node):
         """Check whether given decl_info object is a valid struct member."""
 
         if decl_info.identifier is None:
-            # someone snuck an abstract declarator into here!
-            err = f"missing name of {kind} member"
-            raise CompilerError(err, decl_info.range)
+            # This is allowed only for an unnamed bit-field.
+            if decl_info.bitfield is None:
+                err = f"missing name of {kind} member"
+                raise CompilerError(err, decl_info.range)
+            return
 
         if decl_info.storage is not None:
             err = f"cannot have storage specifier on {kind} member"

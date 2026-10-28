@@ -14,7 +14,7 @@ import shivyc.parser.utils as p
 import shivyc.token_kinds as token_kinds
 import shivyc.tree.decl_nodes as decl_nodes
 import shivyc.tree.general_nodes as general_nodes
-from shivyc.parser.expression import parse_expression
+from shivyc.parser.expression import parse_expression, parse_assignment
 from shivyc.parser.utils import (add_range, ParserError, match_token, token_is,
                                  raise_error, log_error, token_in)
 
@@ -90,7 +90,7 @@ def parse_abstract_declarator(index):
 
 
 @add_range
-def parse_decls_inits(index, parse_inits=True):
+def parse_decls_inits(index, parse_inits=True, parse_bitfields=False):
     """Parse declarations and initializers into a decl_nodes.Root node.
 
     Ex:
@@ -103,9 +103,13 @@ def parse_decls_inits(index, parse_inits=True):
     If `parse_inits` is false, do not permit initializers. This is useful
     for parsing struct objects.
 
-    Note that parse_declaration is simply a wrapper around this function. The
-    reason this logic is not in parse_declaration directly is so that struct
-    member list parsing can reuse this logic.
+    If `parse_bitfields` is true, permit bit-field declarators of the form
+    `declarator : constant-expression`, including unnamed ones like
+    `: 3`. This is used for parsing struct/union member lists.
+
+    Note that parse_declaration is simply a wrapper around this function.
+    The reason this logic is not in parse_declaration directly is so that
+    struct member list parsing can reuse this logic.
     """
     specs, index = parse_decl_specifiers(index)
 
@@ -117,14 +121,32 @@ def parse_decls_inits(index, parse_inits=True):
 
     decls = []
     inits = []
+    bitfields = []
 
     while True:
+        # An unnamed bit-field, like `int : 3`, has no declarator.
+        if parse_bitfields and token_is(index, token_kinds.colon):
+            width_node, index = _parse_bitfield_width(index + 1)
+            unnamed = decl_nodes.Identifier(None)
+            unnamed.r = width_node.r
+            decls.append(unnamed)
+            bitfields.append(width_node)
+            break
+
         node, index = parse_declarator(index, is_typedef)
         decls.append(node)
 
+        if parse_bitfields and token_is(index, token_kinds.colon):
+            # A named bit-field, like `int a : 3`. A bit-field cannot be
+            # combined with other declarators or have an initializer.
+            width_node, index = _parse_bitfield_width(index + 1)
+            bitfields.append(width_node)
+            break
+        else:
+            bitfields.append(None)
+
         if token_is(index, token_kinds.equals) and parse_inits:
             # Parse initializer expression
-            from shivyc.parser.expression import parse_assignment
             expr, index = parse_assignment(index + 1)
             inits.append(expr)
         else:
@@ -138,8 +160,17 @@ def parse_decls_inits(index, parse_inits=True):
 
     index = match_token(index, token_kinds.semicolon, ParserError.AFTER)
 
-    node = decl_nodes.Root(specs, decls, inits)
+    node = decl_nodes.Root(specs, decls, inits, bitfields)
     return node, index
+
+
+def _parse_bitfield_width(index):
+    """Parse the constant expression giving a bit-field's width.
+
+    index - index right past the colon introducing the width.
+    Returns the parsed expression node and the index right past it.
+    """
+    return parse_assignment(index)
 
 
 def parse_decl_specifiers(index, _spec_qual=False):
@@ -296,7 +327,7 @@ def parse_struct_union_members(index):
         if token_is(index, token_kinds.close_brack):
             return members, index + 1
 
-        node, index = parse_decls_inits(index, False)
+        node, index = parse_decls_inits(index, False, True)
         members.append(node)
 
 

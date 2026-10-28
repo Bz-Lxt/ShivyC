@@ -5,6 +5,11 @@ import copy
 import shivyc.token_kinds as token_kinds
 
 
+def _round_up(value, multiple):
+    """Round value up to the nearest multiple of the given number."""
+    return ((value + multiple - 1) // multiple) * multiple
+
+
 class CType:
     """Represents a C type, like `int` or `double` or a struct or union.
 
@@ -77,6 +82,10 @@ class CType:
     def is_struct_union(self):
         """Check whether this has struct or union type."""
         return False
+
+    def alignment(self):
+        """Return the ABI alignment of this type, in bytes."""
+        return self.size
 
     def make_unsigned(self):
         """Return an unsigned version of this type."""
@@ -243,6 +252,10 @@ class ArrayCType(CType):
         """Check whether this is an array type."""
         return True
 
+    def alignment(self):
+        """Alignment of an array is the alignment of its elements."""
+        return self.el.alignment()
+
 
 class FunctionCType(CType):
     """Represents a function C type.
@@ -292,9 +305,8 @@ class _UnionStructCType(CType):
 
     tag - Name of the struct/union as a string, or None if it's anonymous
 
-    members - List of members of this type. Each element of the list should be
-    a tuple (str, ctype) where `str` is the string of the identifier used to
-    access that member and ctype is the ctype of that member.
+    members - List of members of this type. Each element is a triple
+    (name, ctype, bit_width) as described in the StructCType docs.
     complete - Boolean indicating whether this type is complete
     """
 
@@ -302,7 +314,12 @@ class _UnionStructCType(CType):
         self.tag = tag
         self.members = members
         self.offsets = {}
+        self.align = 1
         super().__init__(1)
+
+    def alignment(self):
+        """Return the ABI alignment of this struct or union, in bytes."""
+        return self.align
 
     def weak_compat(self, other):
         """Return True if other is a compatible type to self.
@@ -328,11 +345,16 @@ class _UnionStructCType(CType):
         return True
 
     def get_offset(self, member):
-        """Get the offset and type of a given member.
+        """Get the offset, type, and bit-field info of a given member.
 
-        If the member does not exist, this function returns None tuple.
+        If the member does not exist, this function returns a tuple of
+        Nones. Otherwise, it returns an (offset, ctype, bitfield) tuple,
+        where offset is the byte offset of the member, and bitfield is
+        None for a non-bit-field member, or a (bit_pos, bit_width) tuple
+        for a bit-field, with bit_pos being the bit position of the
+        field within its allocation unit.
         """
-        return self.offsets.get(member, (None, None))
+        return self.offsets.get(member, (None, None, None))
 
     def set_members(self, members):
         """Add the given members to this type.
@@ -349,12 +371,63 @@ class StructCType(_UnionStructCType):
     def set_members(self, members):
         self.members = members
 
-        cur_offset = 0
-        for member, ctype in members:
-            self.offsets[member] = cur_offset, ctype
-            cur_offset += ctype.size
+        # If this struct has no bit-fields, use the historical tight
+        # packing layout, where every member is placed directly after the
+        # previous one with no padding.
+        if not any(bit_width is not None
+                   for _, _, bit_width in members):
+            cur_offset = 0
+            for name, ctype, _ in members:
+                self.offsets[name] = cur_offset, ctype, None
+                cur_offset += ctype.size
+            self.size = cur_offset
+            self.align = 1
+            return
 
-        self.size = cur_offset
+        # This struct contains a bit-field, so lay it out following the
+        # x86-64 System V ABI. Bit positions are tracked relative to the
+        # start of the struct.
+        cur_bit = 0
+        align = 1
+
+        for name, ctype, bit_width in members:
+            if bit_width is None:
+                # A regular (non-bit-field) member starts at a naturally
+                # aligned offset.
+                member_align = ctype.alignment()
+                cur_bit = _round_up(cur_bit, member_align * 8)
+                self.offsets[name] = cur_bit // 8, ctype, None
+                cur_bit += ctype.size * 8
+                if name is not None:
+                    align = max(align, member_align)
+
+            elif bit_width == 0:
+                # A zero-width bit-field pads up to the next boundary of an
+                # allocation unit of its declared type.
+                unit_bits = ctype.size * 8
+                cur_bit = _round_up(cur_bit, unit_bits)
+
+            else:
+                # Allocate the field within a naturally aligned unit of the
+                # size of its declared type. The field must fit entirely in
+                # one allocation unit, so start a new unit if needed.
+                unit_bits = ctype.size * 8
+                unit_start = (cur_bit // unit_bits) * unit_bits
+                if cur_bit - unit_start + bit_width > unit_bits:
+                    unit_start += unit_bits
+                    cur_bit = unit_start
+
+                bit_in_unit = cur_bit - unit_start
+                self.offsets[name] = (
+                    unit_start // 8, ctype, (bit_in_unit, bit_width))
+                cur_bit += bit_width
+
+                # Unnamed bit-fields do not contribute to struct alignment.
+                if name is not None:
+                    align = max(align, ctype.size)
+
+        self.align = align
+        self.size = _round_up(cur_bit, align * 8) // 8
 
 
 class UnionCType(_UnionStructCType):
@@ -365,9 +438,26 @@ class UnionCType(_UnionStructCType):
 
     def set_members(self, members):
         self.members = members
-        self.size = max([ctype.size for _, ctype in members], default=0)
-        for member, ctype in members:
-            self.offsets[member] = 0, ctype
+
+        size = 0
+        align = 1
+        for name, ctype, bit_width in members:
+            if bit_width is None:
+                self.offsets[name] = 0, ctype, None
+                if name is not None:
+                    size = max(size, ctype.size)
+                    align = max(align, ctype.alignment())
+            elif bit_width == 0:
+                # A zero-width bit-field occupies no space in a union.
+                pass
+            else:
+                self.offsets[name] = 0, ctype, (0, bit_width)
+                if name is not None:
+                    size = max(size, ctype.size)
+                    align = max(align, ctype.size)
+
+        self.size = size
+        self.align = align
 
 
 # These definitions are here to permit convenient creation of new integer,

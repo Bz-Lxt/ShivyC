@@ -225,6 +225,148 @@ class RelativeLValue(LValue):
         return out
 
 
+# Mapping from storage unit size, in bytes, to the unsigned integer
+# ctype of that size.
+_UNSIGNED_UNIT_CTYPES = {1: ctypes.unsig_char,
+                         2: ctypes.unsig_short,
+                         4: ctypes.unsig_int,
+                         8: ctypes.unsig_longint}
+
+
+class BitFieldLValue(LValue):
+    """Represents a bit-field within a struct or union.
+
+    This wraps an LValue for the bit-field's whole allocation unit (an
+    unsigned integer ILValue of 1, 2, 4, or 8 bytes), and performs the
+    extraction, sign-extension, and read-modify-write logic needed to
+    access just the bits of the field.
+
+    storage - LValue for the whole allocation unit holding this field
+    field_ctype - declared ctype of this bit-field (may be const)
+    bit_pos - position of this field, in bits, within its allocation unit
+    bit_width - width of this field in bits
+    r - Range of the expression, for error reporting
+
+    """
+    def __init__(self, storage, field_ctype, bit_pos, bit_width, r=None):
+        """Initialize this bit-field lvalue."""
+        self.storage = storage
+        self._ctype = field_ctype
+        self.bit_pos = bit_pos
+        self.bit_width = bit_width
+        self.r = r
+
+    def ctype(self):  # noqa D102
+        return self._ctype
+
+    def addr(self, il_code):  # noqa D102
+        err = "cannot take address of bit-field"
+        raise CompilerError(err, self.r)
+
+    def _work_types(self):
+        """Return ctypes used to manipulate this field.
+
+        Returns a tuple of the unsigned storage unit ctype, the signed
+        working ctype (at least 32 bits wide), and the width, in bits, of
+        the working ctype.
+        """
+        unit_size = self.storage.ctype().size
+        unit_unsigned = _UNSIGNED_UNIT_CTYPES[unit_size]
+        if unit_size == 8:
+            return unit_unsigned, ctypes.longint, 64
+        else:
+            return unit_unsigned, ctypes.integer, 32
+
+    def _literal(self, il_code, value, ctype):
+        """Register an integer literal ILValue of given ctype."""
+        lit = ILValue(ctype)
+        il_code.register_literal_var(lit, value)
+        return lit
+
+    def _shift(self, il_code, output, value, amount, left):
+        """Emit a shift of value by a compile-time constant amount."""
+        amount_il = self._literal(il_code, amount, value.ctype)
+        if left:
+            command = math_cmds.LBitShift
+        else:
+            command = math_cmds.RBitShift
+        il_code.add(command(output, value, amount_il))
+
+    def val(self, il_code):  # noqa D102
+        unit_unsigned, work_signed, work_bits = self._work_types()
+        width = self.bit_width
+        pos = self.bit_pos
+
+        # Read the whole allocation unit and widen it, zero-extended, into
+        # the working register.
+        raw = self.storage.val(il_code)
+        work = set_type(raw, work_signed, il_code)
+
+        # Shift the field bits to the bottom of the register and mask off
+        # everything else. The right shift is arithmetic, but the mask
+        # removes any bits shifted in from the top.
+        shifted = ILValue(work_signed)
+        self._shift(il_code, shifted, work, pos, False)
+
+        mask = (1 << width) - 1
+        masked = ILValue(work_signed)
+        il_code.add(math_cmds.And(
+            masked, shifted, self._literal(il_code, mask, work_signed)))
+
+        # Sign-extend a signed field from its own width to the full width
+        # of the working register using a left shift followed by an
+        # arithmetic right shift.
+        if self._ctype.signed:
+            left = ILValue(work_signed)
+            self._shift(il_code, left, masked, work_bits - width, True)
+            extended = ILValue(work_signed)
+            self._shift(il_code, extended, left, work_bits - width, False)
+            value = extended
+        else:
+            value = masked
+
+        out = ILValue(self._ctype.make_unqual())
+        set_type(value, out.ctype, il_code, out)
+        return out
+
+    def set_to(self, rvalue, il_code, r):  # noqa D102
+        unit_unsigned, work_signed, work_bits = self._work_types()
+        width = self.bit_width
+        pos = self.bit_pos
+
+        check_cast(rvalue, self._ctype, r)
+        field_value = set_type(
+            rvalue, self._ctype.make_unqual(), il_code)
+        work_value = set_type(field_value, work_signed, il_code)
+
+        # Keep only the low `width` bits of the value, and shift them into
+        # position.
+        mask = (1 << width) - 1
+        bits = ILValue(work_signed)
+        il_code.add(math_cmds.And(
+            bits, work_value, self._literal(il_code, mask, work_signed)))
+        shifted_bits = ILValue(work_signed)
+        self._shift(il_code, shifted_bits, bits, pos, True)
+
+        # Read the old contents of the allocation unit and clear the bits
+        # occupied by this field.
+        raw = self.storage.val(il_code)
+        old_work = set_type(raw, work_signed, il_code)
+        all_bits = (1 << work_bits) - 1
+        clear_mask = all_bits ^ (mask << pos)
+        cleared = ILValue(work_signed)
+        il_code.add(math_cmds.And(
+            cleared, old_work,
+            self._literal(il_code, clear_mask, work_signed)))
+
+        # Combine in the new bits and write the unit back.
+        new_work = ILValue(work_signed)
+        il_code.add(math_cmds.Or(new_work, cleared, shifted_bits))
+
+        new_unit = set_type(new_work, unit_unsigned, il_code)
+        return self.storage.set_to(new_unit, il_code, r)
+
+
 @contextmanager
 def report_err():
     """Catch and add any errors to error collector."""

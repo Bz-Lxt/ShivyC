@@ -3,6 +3,7 @@
 import shivyc.asm_cmds as asm_cmds
 import shivyc.spots as spots
 from shivyc.il_cmds.base import ILCommand
+from shivyc.spots import LiteralSpot
 
 
 class _AddMult(ILCommand):
@@ -333,3 +334,73 @@ class Not(_NegNot):
     """
 
     Inst = asm_cmds.Not
+
+
+class _Bitwise(ILCommand):
+    """Base class for bitwise AND and OR.
+
+    ILValues output, arg1, and arg2 must all have the same integral type.
+    No type conversion is done here.
+
+    Literal operands are always loaded into a register first, because the
+    x86 `and` and `or` instructions cannot accept a 64-bit immediate.
+    """
+
+    # Both AND and OR are commutative.
+    comm = True
+    Inst = None
+
+    def __init__(self, output, arg1, arg2):  # noqa D102
+        self.output = output
+        self.arg1 = arg1
+        self.arg2 = arg2
+
+    def inputs(self):  # noqa D102
+        return [self.arg1, self.arg2]
+
+    def outputs(self):  # noqa D102
+        return [self.output]
+
+    def rel_spot_pref(self):  # noqa D102
+        return {self.output: [self.arg1, self.arg2]}
+
+    def make_asm(self, spotmap, home_spots, get_reg, asm_code):  # noqa D102
+        size = self.arg1.ctype.size
+
+        output_spot = spotmap[self.output]
+        arg1_spot = spotmap[self.arg1]
+        arg2_spot = spotmap[self.arg2]
+
+        # A literal cannot be used directly as a destination register, and
+        # 64-bit immediates are not encodable at all.
+        if isinstance(arg1_spot, LiteralSpot):
+            r = get_reg([output_spot], [arg2_spot])
+            asm_code.add(asm_cmds.Mov(r, arg1_spot, size))
+            arg1_spot = r
+
+        if isinstance(arg2_spot, LiteralSpot):
+            r = get_reg([output_spot], [arg1_spot])
+            asm_code.add(asm_cmds.Mov(r, arg2_spot, size))
+            arg2_spot = r
+
+        if output_spot == arg1_spot:
+            asm_code.add(self.Inst(arg1_spot, arg2_spot, size))
+        elif output_spot == arg2_spot:
+            asm_code.add(self.Inst(arg2_spot, arg1_spot, size))
+        else:
+            temp = get_reg([output_spot], [arg1_spot, arg2_spot])
+            asm_code.add(asm_cmds.Mov(temp, arg1_spot, size))
+            asm_code.add(self.Inst(temp, arg2_spot, size))
+            asm_code.add(asm_cmds.Mov(output_spot, temp, size))
+
+
+class And(_Bitwise):
+    """Bitwise AND of arg1 and arg2, saved to output."""
+
+    Inst = asm_cmds.And
+
+
+class Or(_Bitwise):
+    """Bitwise OR of arg1 and arg2, saved to output."""
+
+    Inst = asm_cmds.Or

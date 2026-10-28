@@ -171,6 +171,12 @@ class Cqo(_ASMCommand): name = "cqo"  # noqa: D101
 class Xor(_ASMCommand): name = "xor"  # noqa: D101
 
 
+class And(_ASMCommand): name = "and"  # noqa: D101
+
+
+class Or(_ASMCommand): name = "or"  # noqa: D101
+
+
 class Cmp(_ASMCommand): name = "cmp"  # noqa: D101
 
 

@@ -6,8 +6,15 @@ from shivyc.ctypes import PointerCType
 from shivyc.errors import CompilerError
 from shivyc.il_gen import ILValue
 from shivyc.tree.expr_base import _RExprNode, _LExprNode
-from shivyc.tree.utils import (IndirectLValue, DirectLValue, RelativeLValue,
-                               get_size)
+from shivyc.tree.utils import (BitFieldLValue, IndirectLValue, DirectLValue,
+                               RelativeLValue, get_size)
+
+# Mapping from a bit-field's declared type size to the ctype of its
+# unsigned allocation unit.
+_UNIT_CTYPES = {1: ctypes.unsig_char,
+                2: ctypes.unsig_short,
+                4: ctypes.unsig_int,
+                8: ctypes.unsig_longint}
 
 
 class AddrOf(_RExprNode):
@@ -151,7 +158,7 @@ class _ObjLookup(_LExprNode):
         self.member = member
 
     def get_offset_info(self, struct_ctype):
-        """Given a struct ctype, return the member offset and ctype.
+        """Given a struct ctype, return the member offset, ctype, and bits.
 
         If the given ctype is None, emits the error for requesting a member
         in something not a structure or union.
@@ -160,7 +167,8 @@ class _ObjLookup(_LExprNode):
             err = "request for member in something not a structure or union"
             raise CompilerError(err, self.r)
 
-        offset, ctype = struct_ctype.get_offset(self.member.content)
+        offset, ctype, bitfield = struct_ctype.get_offset(
+            self.member.content)
         if offset is None:
             err = f"structure or union has no member '{self.member.content}'"
             raise CompilerError(err, self.r)
@@ -168,7 +176,27 @@ class _ObjLookup(_LExprNode):
         if struct_ctype.is_const():
             ctype = ctype.make_const()
 
-        return offset, ctype
+        return offset, ctype, bitfield
+
+    def make_bitfield_lvalue(self, unit_lvalue, ctype, bitfield):
+        """Wrap an allocation-unit lvalue in a BitFieldLValue.
+
+        `unit_lvalue` is an LValue for the bit-field's whole allocation
+        unit, `ctype` is the field's declared ctype, and `bitfield` is its
+        (bit_pos, bit_width) tuple.
+        """
+        bit_pos, bit_width = bitfield
+        return BitFieldLValue(unit_lvalue, ctype, bit_pos, bit_width,
+                              self.r)
+
+    def add_offset(self, il_code, base, offset, ctype):
+        """Compute the address of an object at given byte offset."""
+        shift = ILValue(ctypes.longint)
+        il_code.register_literal_var(shift, str(offset))
+
+        out = ILValue(PointerCType(ctype))
+        il_code.add(math_cmds.Add(out, base, shift))
+        return out
 
 
 class ObjMember(_ObjLookup):
@@ -177,19 +205,30 @@ class ObjMember(_ObjLookup):
     def _lvalue(self, il_code, symbol_table, c):
         head_lv = self.head.lvalue(il_code, symbol_table, c)
         struct_ctype = head_lv.ctype() if head_lv else None
-        offset, ctype = self.get_offset_info(struct_ctype)
+        offset, ctype, bitfield = self.get_offset_info(struct_ctype)
 
         if isinstance(head_lv, DirectLValue):
             head_val = self.head.make_il(il_code, symbol_table, c)
+            if bitfield:
+                unit_size = ctype.make_unqual().size
+                unit_ctype = _UNIT_CTYPES[unit_size]
+                unit_lvalue = RelativeLValue(
+                    unit_ctype, head_val, offset)
+                return self.make_bitfield_lvalue(
+                    unit_lvalue, ctype, bitfield)
             return RelativeLValue(ctype, head_val, offset)
         else:
             struct_addr = head_lv.addr(il_code)
 
-            shift = ILValue(ctypes.longint)
-            il_code.register_literal_var(shift, str(offset))
+            if bitfield:
+                unit_size = ctype.make_unqual().size
+                unit_ctype = _UNIT_CTYPES[unit_size]
+                unit_addr = self.add_offset(
+                    il_code, struct_addr, offset, unit_ctype)
+                return self.make_bitfield_lvalue(
+                    IndirectLValue(unit_addr), ctype, bitfield)
 
-            out = ILValue(PointerCType(ctype))
-            il_code.add(math_cmds.Add(out, struct_addr, shift))
+            out = self.add_offset(il_code, struct_addr, offset, ctype)
             return IndirectLValue(out)
 
 
@@ -202,7 +241,16 @@ class ObjPtrMember(_ObjLookup):
             err = "first argument of '->' must have pointer type"
             raise CompilerError(err, self.r)
 
-        offset, ctype = self.get_offset_info(struct_addr.ctype.arg)
+        offset, ctype, bitfield = self.get_offset_info(struct_addr.ctype.arg)
+
+        if bitfield:
+            unit_size = ctype.make_unqual().size
+            unit_ctype = _UNIT_CTYPES[unit_size]
+            unit_addr = self.add_offset(
+                il_code, struct_addr, offset, unit_ctype)
+            return self.make_bitfield_lvalue(
+                IndirectLValue(unit_addr), ctype, bitfield)
+
         shift = ILValue(ctypes.longint)
         il_code.register_literal_var(shift, str(offset))
 
